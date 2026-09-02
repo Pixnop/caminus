@@ -99,7 +99,6 @@ public class RoomThermalSystem : ModSystem
 
     public override void Dispose()
     {
-        PerishRatePatch.System = null;
         harmony?.UnpatchAll("caminus");
         harmony = null;
     }
@@ -111,7 +110,6 @@ public class RoomThermalSystem : ModSystem
         api.Logger.Notification("[Caminus] config: tick {0} ms, {1} W per heat unit, {2} wall materials",
             config.TickMs, config.WattsPerHeatStrength, config.WallU.Count);
         rooms = api.ModLoader.GetModSystem<RoomRegistry>();
-        PerishRatePatch.System = this;
         api.Event.RegisterGameTickListener(OnTick, ex => api.Logger.Error("[Caminus] thermal tick: {0}", ex), config.TickMs);
         // ChunkColumnUnloaded fires BEFORE the unload loop (ServerSystemUnloadChunks.cs:287), so the
         // chunk is still writable. GameWorldSave covers the autosave and the save-on-shutdown
