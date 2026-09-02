@@ -1,0 +1,26 @@
+{
+  "tickMs": 1000,
+  "wattsPerHeatStrength": 400,
+  "airCapacityFactor": 5,
+  "openingConductance": 30,
+  "roomForgetSeconds": 300,
+  "wallU": {
+    "Stone": 3.0,
+    "Brick": 2.5,
+    "Ceramic": 2.5,
+    "Soil": 1.5,
+    "Sand": 2.0,
+    "Gravel": 2.5,
+    "Wood": 1.2,
+    "Leaves": 4.0,
+    "Glass": 5.0,
+    "Ice": 4.0,
+    "Snow": 0.8,
+    "Metal": 6.0,
+    "Cloth": 2.0,
+    "Plant": 3.5,
+    "Ore": 3.0,
+    "Mantle": 3.0,
+    "Other": 3.0
+  }
+}
