@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Reflection;
 using System.Text.RegularExpressions;
 using Atlas.Api;
 using Atlas.XUnit;
@@ -32,8 +33,21 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [GeneratedRegex(@"Room: (-?\d+(?:\.\d+)?) °C")]
     private static partial Regex RoomTemp();
 
+    [GeneratedRegex(@"outside (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex OutsideTemp();
+
     [GeneratedRegex(@"Losses: (-?\d+(?:\.\d+)?) W/K")]
     private static partial Regex Losses();
+
+    [GeneratedRegex(@"Ground node: (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex GroundTemp();
+
+    [GeneratedRegex(@"Perish rate: (\d+(?:\.\d+)?)x")]
+    private static partial Regex PerishRate();
+
+    /// <summary>BlockEntityContainer.container is protected: the only way to ask a real chest for its rate.</summary>
+    private static readonly FieldInfo ContainerField =
+        typeof(BlockEntityContainer).GetField("container", BindingFlags.NonPublic | BindingFlags.Instance)!;
 
     [AtlasScenario]
     public async Task Version_command_answers()
@@ -108,6 +122,98 @@ public partial class ThermalScenarios : AtlasScenarioBase
         Assert.Contains("Wood: 54 faces", woodReport);
         Assert.True(Read(Losses(), woodReport) < Read(Losses(), stoneReport),
             $"stone:\n{stoneReport}\nwood:\n{woodReport}");
+    }
+
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Buried_room_has_a_ground_node()
+    {
+        BlockPos inside = await Cellar("CaminusCellar", 240);
+        string report = await WaitForRoomReport(inside, r => r.Contains("Ground walls:"));
+
+        // Interior at Y 1..3 with the worldgen surface at 2: the 9 floor faces (2 m down) and the
+        // 12 side faces of the bottom layer (1 m down) are buried, the other 33 face the open air.
+        Assert.Contains("Outside walls:\n  Stone: 33 faces", report.ReplaceLineEndings("\n"));
+        Assert.Contains("Ground walls:\n  Stone: 21 faces", report.ReplaceLineEndings("\n"));
+        Assert.Contains("at 1.4 m", report); // (9 × 2 + 12 × 1) / 21
+
+        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+        await World.Ticks(300); // about two time constants: 27 m³ × 6030 J/K/m³ over 120 W/K
+
+        string after = await ReportAt(inside);
+        double ground = Read(GroundTemp(), after), outside = Read(OutsideTemp(), after), t = Read(RoomTemp(), after);
+        // The ground node ignores the diurnal swing entirely, so it is almost never equal to the
+        // outside temperature; the room settles on the conductance-weighted mix of the two.
+        Assert.True(Math.Abs(outside - ground) > 1, $"no signal to measure: outside and ground agree\n{after}");
+        double equilibrium = (33 * 3.0 * outside + 21 * 1.0 * ground) / (33 * 3.0 + 21 * 1.0);
+        Assert.True(Math.Abs(t - equilibrium) < 1, $"cellar at {t:0.0} °C, expected about {equilibrium:0.0} °C\n{after}");
+        Assert.True(Math.Abs(t - outside) > 0.1, $"the ground node pulled the cellar nowhere\n{after}");
+    }
+
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Perish_rate_follows_room_temperature()
+    {
+        BlockPos inside = await Room("CaminusPerish", 280, Stone);
+        BlockPos chest = inside.Offset(1, -1, 0);
+        // A chest is sidesolid: false on every face, so the vanilla flood fill runs straight through
+        // it and the block stays part of the room. No food needed: GetPerishRate ignores the contents.
+        World.SetBlock("game:chest-east", chest);
+        LightFirepit(inside.Offset(0, -1, 0));
+        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+
+        string before = await WaitForRoomReport(inside, r => r.Contains("Perish rate:"));
+        double reported = Read(PerishRate(), before);
+        Assert.Equal(reported, ContainerPerishRate(chest), 2); // the postfix is live, not just our report
+
+        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+        await World.Ticks(300);
+
+        string after = await ReportAt(inside);
+        double heated = Read(PerishRate(), after);
+        Assert.True(heated > reported, $"perish rate went {reported:0.000} -> {heated:0.000}\nbefore:\n{before}\nafter:\n{after}");
+        Assert.Equal(heated, ContainerPerishRate(chest), 2);
+    }
+
+    // Room_temperature_survives_a_restart is NOT an Atlas scenario. [AtlasScenario(RestartWorld = true)]
+    // fails a class that has joined test players (their connections die with the host), and every room
+    // here needs a player standing in it for the mod to track it; seeding the room before the restart
+    // from another scenario is ruled out too, since xUnit gives no intra-class ordering. What the
+    // restart would exercise is split in two and covered: the analytic catch-up by
+    // ThermalNetworkTests.Relax_MatchesIntegratingTheSameSpan, and the write itself by the moddata
+    // round trip through IServerChunk, which stays a manual in-game check (heat a cabin, quit, come
+    // back a few game days later, /caminus temp).
+
+    /// <summary>
+    /// 3×3×3 stone-lined cellar dug as deep as the world allows under the world-generated surface,
+    /// with the player inside. Atlas's superflat world only has terrain down to Y 0, so the cellar
+    /// ends up half buried: exactly what makes it interesting, both wall groups show up at once.
+    /// </summary>
+    private async Task<BlockPos> Cellar(string playerName, int dx)
+    {
+        ITestPlayer player = await World.JoinPlayer(playerName);
+        BlockPos surface = World.Spawn.Offset(dx, 0, 40);
+        await player.TeleportTo(surface);
+        await World.Until(() => World.Api.World.BlockAccessor.GetChunkAtBlockPos(surface) != null, 1200);
+
+        int surfaceY = World.Api.World.BlockAccessor.GetTerrainMapheightAt(surface);
+        Assert.True(surfaceY == 2, $"worldgen surface at Y={surfaceY}: the face counts asserted below assume 2");
+        BlockPos min = new(surface.X, Math.Max(1, surfaceY - 8), surface.Z, surface.dimension);
+        for (int x = -1; x <= Inner; x++)
+            for (int y = -1; y <= Inner; y++)
+                for (int z = -1; z <= Inner; z++)
+                {
+                    bool shell = x < 0 || y < 0 || z < 0 || x == Inner || y == Inner || z == Inner;
+                    World.SetBlock(shell ? Stone : Air, min.Offset(x, y, z));
+                }
+
+        BlockPos center = min.Offset(1, 1, 1);
+        await player.TeleportTo(center);
+        return center;
+    }
+
+    private double ContainerPerishRate(BlockPos pos)
+    {
+        BlockEntityContainer be = World.BlockEntityAt<BlockEntityContainer>(pos) ?? throw new XunitException($"no container at {pos}");
+        return ((InWorldContainer)ContainerField.GetValue(be)!).GetPerishRate();
     }
 
     /// <summary>

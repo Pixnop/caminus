@@ -189,4 +189,36 @@ public class ThermalNetworkTests
         Assert.Equal(100.0, net.GetTemperature(f2));
         Assert.Equal(0, net.GetTemperature(n), 1e-6); // n only sees f1
     }
+
+    // Offline relaxation: skipping 1000 steps analytically lands where integrating them does.
+    // This is the round trip a room takes when its chunk unloads and comes back.
+    [Fact]
+    public void Relax_MatchesIntegratingTheSameSpan()
+    {
+        const double c = 150_000, gOut = 20, gGround = 34, tOut = -4, tGround = 9, q = 800, t0 = 21;
+        var net = new ThermalNetwork();
+        int outside = net.AddFixedNode(tOut);
+        int ground = net.AddFixedNode(tGround);
+        int room = net.AddNode(c, t0);
+        net.AddEdge(room, outside, gOut);
+        net.AddEdge(room, ground, gGround);
+        net.SetSourcePower(room, q);
+
+        const double dt = 5;
+        for (int i = 0; i < 1000; i++) net.Step(dt);
+
+        double g = gOut + gGround;
+        double teq = (gOut * tOut + gGround * tGround + q) / g;
+        double relaxed = ThermalNetwork.Relax(t0, teq, 1000 * dt, c / g);
+        // Implicit Euler is first order, so the two only agree to within the step's own error.
+        Assert.Equal(relaxed, net.GetTemperature(room), 0.01);
+    }
+
+    // Degenerate spans: no elapsed time changes nothing, a very long one lands on equilibrium.
+    [Fact]
+    public void Relax_ZeroSpanKeepsState_LongSpanReachesEquilibrium()
+    {
+        Assert.Equal(21.0, ThermalNetwork.Relax(21, 5, 0, 3000));
+        Assert.Equal(5.0, ThermalNetwork.Relax(21, 5, 1e9, 3000), 1e-9);
+    }
 }

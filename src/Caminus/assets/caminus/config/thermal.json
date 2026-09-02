@@ -4,6 +4,7 @@
   "airCapacityFactor": 5,
   "openingConductance": 30,
   "roomForgetSeconds": 300,
+  "groundContactU": 1.0,
   "wallU": {
     "Stone": 3.0,
     "Brick": 2.5,

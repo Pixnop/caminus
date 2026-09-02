@@ -99,6 +99,16 @@ public sealed class ThermalNetwork
         return _conductance[edge] * (_temperature[_edgeA[edge]] - _temperature[_edgeB[edge]]);
     }
 
+    /// <summary>
+    /// Exact solution of C·dT/dt = G·(equilibrium − T) over dt seconds, with tau = C/G.
+    /// A single node whose neighbours hold a fixed temperature obeys that first-order ODE, so
+    /// this closed form is not an approximation of <see cref="Step"/>: it is what stepping
+    /// converges to as the step shrinks. Used to catch a room up after it was unloaded, instead
+    /// of replaying thousands of steps or resetting it.
+    /// </summary>
+    public static double Relax(double temperature, double equilibrium, double dtSeconds, double tau) =>
+        equilibrium + (temperature - equilibrium) * Math.Exp(-dtSeconds / tau);
+
     /// <summary>Advances the state by dt seconds (implicit Euler, solving a dense linear system).</summary>
     public void Step(double dtSeconds)
     {

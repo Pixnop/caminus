@@ -23,5 +23,7 @@
   <ItemGroup>
     <Reference Include="VintagestoryAPI"><HintPath>$(VintageStoryDir)/VintagestoryAPI.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="VSSurvivalMod"><HintPath>$(VintageStoryDir)/Mods/VSSurvivalMod.dll</HintPath><Private>false</Private></Reference>
+    <!-- InWorldContainer, to call GetPerishRate on a real container and prove the Harmony patch is live. -->
+    <Reference Include="VSEssentials"><HintPath>$(VintageStoryDir)/Mods/VSEssentials.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>

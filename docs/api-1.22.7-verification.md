@@ -106,6 +106,12 @@ rate = clamp(3^(v/19 - 1.2) - 0.1, 0.1, 2.4)
 
 `ConstantPerishRateContainer : InWorldContainer` overrides `GetPerishRate`: overriding is the intended mechanism.
 
+`InWorldContainer` members a patch can reach: `Room`, `Inventory` (calls `inventorySupplier()`) and
+`Inventory.Api` / `Inventory.Pos` are public; `positionProvider` is **protected** and has no
+property, so a postfix needs `AccessTools.FieldRefAccess<InWorldContainer,
+Vintagestory.GameContent.PositionProviderDelegate>("positionProvider")`. Qualify that delegate:
+`Vintagestory.API.Common` declares another one of the same name returning `Vec3d`.
+
 Non-Harmony hooks, in order of cleanliness:
 1. `InventoryBase.OnAcquireTransitionSpeed` (event `CustomGetTransitionSpeedMulDelegate(EnumTransitionType, ItemStack, float mulByConfig)`), composed via `mul *= handler(...)` (InventoryBase.cs:795). Multiplicative, doesn't replace.
 2. `GlobalConstants.PerishSpeedModifier` (global).
@@ -124,7 +130,10 @@ Globally replacing the formula = Harmony postfix on `InWorldContainer.GetPerishR
 pushed into moddata on unload, NOT repopulated on load (must be reloaded yourself via `GetModdata`).
 `SetModdataObject` doesn't exist.
 
-`IServerChunk.SetServerModdata / GetServerModdata`: server only, not synced.
+`IServerChunk.SetServerModdata / GetServerModdata`: server only, not synced. **Gotcha**: unlike
+`WorldChunk.SetModdata` (which calls `MarkModified`), `ServerChunk.SetServerModdata` (l.659) only
+writes the dictionary. Both `TryUnloadChunk` and the autosave skip chunks whose `DirtyForSaving` is
+false, so a `chunk.MarkModified()` after every write is mandatory or the data never reaches the save.
 `IMapRegion.SetModdata / GetModdata<T>`: server only, no `defaultValue`.
 `ISaveGame.StoreData / GetData<T>` via `sapi.WorldManager.SaveGame`.
 
@@ -132,6 +141,9 @@ Events (IServerEventAPI): `ChunkColumnLoaded(Vec2i, IWorldChunk[])`, `ChunkColum
 (fired BEFORE the unload loop, ServerSystemUnloadChunks.cs:287: chunks are still readable),
 `BeginChunkColumnLoadChunkThread`. `BeforeChunkColumnUnloaded` doesn't exist.
 `MapRegionLoaded(Vec2i, IMapRegion)` / `MapRegionUnloaded` on IEventAPI.
+`GameWorldSave` (`Action`) fires on the autosave (ServerSystemAutoSaveGame.cs:77) **and** on the
+save-on-shutdown (ServerSystemLoadAndSaveGame.cs:204), before the chunks are written: the one hook
+that covers "persist everything before we go away".
 
 ## 6. Tick and calendar
 
@@ -165,6 +177,15 @@ guard with `Harmony.HasAnyPatches(id)` (singleplayer = client + server in the sa
 `EnumBlockMaterial`: Air, Soil, Gravel, Sand, Wood, Leaves, Stone, Ore, Water, Snow, Ice, Metal, Mantle,
 Plant, Glass, Ceramic, Cloth, Lava, Brick, Fire, Meta, Other.
 `Block.SideSolid`: `struct SmallBoolArray` indexed by `BlockFacing.Index`. `Attributes` inherited from `CollectibleObject`.
+
+Surface height, two maps with near-identical names (IBlockAccessor.cs:474-506):
+`GetTerrainMapheightAt(pos)` reads `IMapChunk.WorldGenTerrainHeightMap`, the topmost solid Y as
+worldgen left it, never updated afterwards. `GetRainMapHeightAt(pos)` reads `RainHeightMap`, which
+IS updated on every block placement, so the roof of a building becomes the "surface" and the
+building's own walls then read as buried. For "is this face against natural ground", the worldgen
+map is the right one. Both return 0 when the map chunk isn't loaded, and both are meaningless
+outside the normal dimension. `BlockAccessorReadLockfree.GetRainMapHeightAt(BlockPos)` (l.306)
+actually returns the *worldgen* map: the two accessors disagree on that overload.
 
 `Block.GetRetention(pos, facing, EnumRetentionType)` (Block.cs:2025): behaviors first, then for Heat:
 solid Ore/Stone/Soil/Ceramic = -1, other solids = +1, non-solid face = 0.
