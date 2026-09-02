@@ -25,11 +25,11 @@ public class CaminusModSystem : ModSystem
                 .WithArgs(api.ChatCommands.Parsers.OptionalWorldPosition("pos"))
                 .HandleWith(args =>
                 {
-                    BlockPos? pos = (args[0] as Vec3d)?.AsBlockPos ?? args.Caller.Entity?.Pos.AsBlockPos;
+                    BlockPos? pos = (args[0] as Vec3d)?.AsBlockPos ?? (args.Caller.Entity == null ? null : RoomThermalSystem.EyeBlockPos(args.Caller.Entity));
                     if (pos == null) return TextCommandResult.Error("Position required from the console: /caminus temp x y z");
                     return api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetReport(pos, out string report)
                         ? TextCommandResult.Success(report)
-                        : TextCommandResult.Success("No room detected here.");
+                        : TextCommandResult.Success("No enclosed room here.");
                 })
             .EndSubCommand();
     }

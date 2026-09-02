@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using Caminus.Core;
 using Vintagestory.API.Common;
+using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 using Vintagestory.GameContent;
@@ -105,14 +106,27 @@ public class RoomThermalSystem : ModSystem
         foreach (RoomEntry e in entries.Values) e.Temperature = network.GetTemperature(e.Node);
     }
 
+    /// <summary>
+    /// Block at eye height. The feet position lands inside the slab, stair or ground block the
+    /// player stands on, and the vanilla registry then returns a one-block "room" inside it.
+    /// </summary>
+    public static BlockPos EyeBlockPos(Entity entity)
+    {
+        BlockPos pos = entity.Pos.AsBlockPos;
+        pos.Y = (int)Math.Floor(entity.Pos.Y + entity.LocalEyePos.Y);
+        return pos;
+    }
+
     private void TrackPlayerRooms(long nowMs)
     {
         foreach (IPlayer player in sapi.World.AllOnlinePlayers)
         {
             if (player is not IServerPlayer { ConnectionState: EnumClientState.Playing } sp || sp.Entity == null) continue;
-            BlockPos pos = sp.Entity.Pos.AsBlockPos;
+            BlockPos pos = EyeBlockPos(sp.Entity);
             Room room = rooms.GetRoomForPosition(pos);
-            if (room?.Location == null || room.PosInRoom == null) continue;
+            // ponytail: an open volume (a doorway to the outside, a hall wider than the vanilla
+            // 14-block limit) is treated as outside; milestone 6 brings the homemade flood fill.
+            if (room?.Location == null || room.PosInRoom == null || room.ExitCount > 0) continue;
             Track(room, pos.dimension, nowMs);
         }
     }
@@ -205,7 +219,9 @@ public class RoomThermalSystem : ModSystem
     private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face)
     {
         Block block = acc.GetBlock(nb);
-        if (block == null || !block.SideSolid[face.Opposite.Index]) { geom.Openings++; return; }
+        // Same criterion as the vanilla RoomRegistry (RoomRegistry.cs:418): a closed door, a glass
+        // pane or a chiseled block retains heat even though its faces are not "solid".
+        if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0) { geom.Openings++; return; }
         EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
         var prev = geom.Walls.GetValueOrDefault(mat);
         geom.Walls[mat] = (prev.Faces + 1, prev.WPerK + config.UFor(mat));

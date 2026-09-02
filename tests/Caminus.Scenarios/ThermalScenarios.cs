@@ -68,20 +68,31 @@ public partial class ThermalScenarios : AtlasScenarioBase
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
-    public async Task Opening_a_wall_adds_losses()
+    public async Task Glass_pane_replaces_a_stone_face()
     {
-        BlockPos inside = await Room("CaminusOpen", 80, Stone);
-        string closed = await WaitForRoomReport(inside);
-        Assert.DoesNotContain("Openings", closed);
+        BlockPos inside = await Room("CaminusPane", 80, Stone);
+        string stone = await WaitForRoomReport(inside);
+        Assert.DoesNotContain("Openings", stone);
 
-        // One wall face replaced with a glass pane: Caminus counts it as an opening (30 W/K)
-        // instead of a stone wall (3 W/K), i.e. +27 W/K.
+        // One wall face replaced with a glass pane: still an enclosed room for the vanilla
+        // registry (the pane retains heat across its plane) and a Glass wall for Caminus
+        // (5 W/K instead of 3 W/K for stone, i.e. +2 W/K).
         World.SetBlock(Pane, inside.Offset(0, 0, -2));
-        string opened = await WaitForRoomReport(inside, r => r.Contains("Openings"));
+        string glazed = await WaitForRoomReport(inside, r => r.Contains("Glass: 1 faces"));
 
-        Assert.Contains("Openings: 1 faces", opened);
-        double gain = Read(Losses(), opened) - Read(Losses(), closed);
-        Assert.True(Math.Abs(gain - 27.0) < 0.1, $"conductance +{gain:0.0} W/K instead of +27\nclosed:\n{closed}\nopen:\n{opened}");
+        Assert.Contains("Stone: 53 faces", glazed);
+        Assert.DoesNotContain("Openings", glazed);
+        double gain = Read(Losses(), glazed) - Read(Losses(), stone);
+        Assert.True(Math.Abs(gain - 2.0) < 0.1, $"conductance +{gain:0.0} W/K instead of +2\nstone:\n{stone}\nglazed:\n{glazed}");
+    }
+
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Open_air_is_not_a_room()
+    {
+        ITestPlayer player = await World.JoinPlayer("CaminusOutside");
+        await player.TeleportTo(World.Spawn.Offset(200, 0, 40));
+        await World.Ticks(90); // three mod ticks
+        Assert.Contains("No enclosed room here.", await ReportAt(player.Position));
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
