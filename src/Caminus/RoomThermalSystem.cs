@@ -183,19 +183,21 @@ public class RoomThermalSystem : ModSystem
         for (int x = c.MinX; x <= c.MaxX; x++)
             for (int y = c.MinY; y <= c.MaxY; y++)
                 for (int z = c.MinZ; z <= c.MaxZ; z++)
-                {
-                    pos.Set(x, y, z);
-                    if (!room.Contains(pos)) continue;
-                    geom.Volume++;
-                    foreach (BlockFacing face in BlockFacing.ALLFACES)
-                    {
-                        nb.Set(x + face.Normali.X, y + face.Normali.Y, z + face.Normali.Z);
-                        if (!room.Contains(nb)) AddFace(geom, acc, nb, face);
-                    }
-                }
+                    MeasureAirBlock(geom, room, acc, pos.Set(x, y, z), nb);
 
         geom.Conductance = geom.Walls.Values.Sum(w => w.WPerK) + geom.Openings * config.OpeningConductance;
         return geom;
+    }
+
+    private void MeasureAirBlock(Geometry geom, Room room, IBlockAccessor acc, BlockPos pos, BlockPos nb)
+    {
+        if (!room.Contains(pos)) return;
+        geom.Volume++;
+        foreach (BlockFacing face in BlockFacing.ALLFACES)
+        {
+            nb.Set(pos.X + face.Normali.X, pos.Y + face.Normali.Y, pos.Z + face.Normali.Z);
+            if (!room.Contains(nb)) AddFace(geom, acc, nb, face);
+        }
     }
 
     /// <summary>Face d'un bloc d'air vers l'extérieur de la pièce : paroi (bloc solide côté pièce) ou ouverture.</summary>
