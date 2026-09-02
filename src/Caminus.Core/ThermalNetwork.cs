@@ -131,13 +131,7 @@ public sealed class ThermalNetwork
     {
         for (int k = 0; k < n; k++)
         {
-            int p = k;
-            for (int i = k + 1; i < n; i++) if (Math.Abs(_m[i, k]) > Math.Abs(_m[p, k])) p = i;
-            if (p != k)
-            {
-                for (int j = k; j < n; j++) (_m[k, j], _m[p, j]) = (_m[p, j], _m[k, j]);
-                (_rhs[k], _rhs[p]) = (_rhs[p], _rhs[k]);
-            }
+            SwapRows(k, PivotRow(k, n), n);
             double pivot = _m[k, k];
             if (pivot == 0) throw new InvalidOperationException("Réseau thermique singulier : un nœud libre sans capacité ni conductance ?");
             for (int i = k + 1; i < n; i++)
@@ -154,6 +148,20 @@ public sealed class ThermalNetwork
             for (int j = i + 1; j < n; j++) s -= _m[i, j] * _rhs[j];
             _rhs[i] = s / _m[i, i];
         }
+    }
+
+    private int PivotRow(int k, int n)
+    {
+        int p = k;
+        for (int i = k + 1; i < n; i++) if (Math.Abs(_m[i, k]) > Math.Abs(_m[p, k])) p = i;
+        return p;
+    }
+
+    private void SwapRows(int k, int p, int n)
+    {
+        if (p == k) return;
+        for (int j = k; j < n; j++) (_m[k, j], _m[p, j]) = (_m[p, j], _m[k, j]);
+        (_rhs[k], _rhs[p]) = (_rhs[p], _rhs[k]);
     }
 
     private static int Check(int index, int count, string name) =>

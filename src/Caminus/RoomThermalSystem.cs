@@ -59,7 +59,7 @@ public class RoomThermalSystem : ModSystem
     private ThermalNetwork? network;
     private bool dirty;
 
-    public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Server;
+    public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Server;
 
     public override void StartServerSide(ICoreServerAPI api)
     {
@@ -75,21 +75,8 @@ public class RoomThermalSystem : ModSystem
     {
         if (dtRealSeconds <= 0) return;
         long nowMs = sapi.World.ElapsedMilliseconds;
-
-        foreach (IPlayer player in sapi.World.AllOnlinePlayers)
-        {
-            if (player is not IServerPlayer { ConnectionState: EnumClientState.Playing } sp || sp.Entity == null) continue;
-            BlockPos pos = sp.Entity.Pos.AsBlockPos;
-            Room room = rooms.GetRoomForPosition(pos);
-            if (room?.Location == null || room.PosInRoom == null) continue;
-            Track(room, pos.dimension, nowMs);
-        }
-
-        foreach (var key in entries.Where(e => (nowMs - e.Value.LastSeenMs) / 1000.0 > config.RoomForgetSeconds).Select(e => e.Key).ToList())
-        {
-            entries.Remove(key);
-            dirty = true;
-        }
+        TrackPlayerRooms(nowMs);
+        ForgetStaleRooms(nowMs);
         if (entries.Count == 0) { network = null; dirty = false; return; }
 
         foreach (RoomEntry e in entries.Values)
@@ -115,6 +102,27 @@ public class RoomThermalSystem : ModSystem
         network!.Step(dt);
 
         foreach (RoomEntry e in entries.Values) e.Temperature = network.GetTemperature(e.Node);
+    }
+
+    private void TrackPlayerRooms(long nowMs)
+    {
+        foreach (IPlayer player in sapi.World.AllOnlinePlayers)
+        {
+            if (player is not IServerPlayer { ConnectionState: EnumClientState.Playing } sp || sp.Entity == null) continue;
+            BlockPos pos = sp.Entity.Pos.AsBlockPos;
+            Room room = rooms.GetRoomForPosition(pos);
+            if (room?.Location == null || room.PosInRoom == null) continue;
+            Track(room, pos.dimension, nowMs);
+        }
+    }
+
+    private void ForgetStaleRooms(long nowMs)
+    {
+        foreach (var key in entries.Where(e => (nowMs - e.Value.LastSeenMs) / 1000.0 > config.RoomForgetSeconds).Select(e => e.Key).ToList())
+        {
+            entries.Remove(key);
+            dirty = true;
+        }
     }
 
     private void Track(Room room, int dim, long nowMs)
@@ -182,18 +190,22 @@ public class RoomThermalSystem : ModSystem
                     foreach (BlockFacing face in BlockFacing.ALLFACES)
                     {
                         nb.Set(x + face.Normali.X, y + face.Normali.Y, z + face.Normali.Z);
-                        if (room.Contains(nb)) continue; // face interne
-                        Block block = acc.GetBlock(nb);
-                        if (block == null || !block.SideSolid[face.Opposite.Index]) { geom.Openings++; continue; }
-                        EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
-                        double u = config.UFor(mat);
-                        var prev = geom.Walls.GetValueOrDefault(mat);
-                        geom.Walls[mat] = (prev.Faces + 1, prev.WPerK + u);
+                        if (!room.Contains(nb)) AddFace(geom, acc, nb, face);
                     }
                 }
 
         geom.Conductance = geom.Walls.Values.Sum(w => w.WPerK) + geom.Openings * config.OpeningConductance;
         return geom;
+    }
+
+    /// <summary>Face d'un bloc d'air vers l'extérieur de la pièce : paroi (bloc solide côté pièce) ou ouverture.</summary>
+    private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face)
+    {
+        Block block = acc.GetBlock(nb);
+        if (block == null || !block.SideSolid[face.Opposite.Index]) { geom.Openings++; return; }
+        EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
+        var prev = geom.Walls.GetValueOrDefault(mat);
+        geom.Walls[mat] = (prev.Faces + 1, prev.WPerK + config.UFor(mat));
     }
 
     /// <summary>Sources de chaleur de la bbox élargie d'un bloc. Réévalué à chaque tick : un foyer s'éteint.</summary>
