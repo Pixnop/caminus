@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Version>0.1.0</Version>
+    <Authors>Pixnop</Authors>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- Dossier du jeu (VintagestoryAPI.dll, Mods/VSEssentials.dll...). Défaut : variable d'environnement VINTAGE_STORY. -->
+    <VintageStoryDir Condition="'$(VintageStoryDir)' == ''">$(VINTAGE_STORY)</VintageStoryDir>
+  </PropertyGroup>
+</Project>

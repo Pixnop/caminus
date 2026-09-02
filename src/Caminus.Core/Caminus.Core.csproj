@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Caminus.Core</RootNamespace>
+    <Description>Moteur thermique nodal de Caminus, sans dépendance au jeu.</Description>
+  </PropertyGroup>
+</Project>

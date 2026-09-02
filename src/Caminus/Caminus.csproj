@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Caminus</RootNamespace>
+    <Description>Simulation thermique du bâtiment pour Vintage Story.</Description>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Caminus.Core/Caminus.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI"><HintPath>$(VintageStoryDir)/VintagestoryAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VintagestoryLib"><HintPath>$(VintageStoryDir)/VintagestoryLib.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VSEssentials"><HintPath>$(VintageStoryDir)/Mods/VSEssentials.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VSSurvivalMod"><HintPath>$(VintageStoryDir)/Mods/VSSurvivalMod.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="protobuf-net"><HintPath>$(VintageStoryDir)/Lib/protobuf-net.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Newtonsoft.Json"><HintPath>$(VintageStoryDir)/Lib/Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(VintageStoryDir)/Lib/0Harmony.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="modinfo.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="assets/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Zip du mod : dll + modinfo + assets, dans dist/ à la racine du dépôt. -->
+  <Target Name="PackageMod" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <ModStaging>$(IntermediateOutputPath)modzip/</ModStaging>
+      <ModZip>$(MSBuildThisFileDirectory)../../dist/caminus_$(Version).zip</ModZip>
+    </PropertyGroup>
+    <ItemGroup>
+      <ModFiles Include="$(OutDir)Caminus.dll;$(OutDir)Caminus.Core.dll;$(OutDir)modinfo.json" />
+      <ModAssets Include="$(OutDir)assets/**" />
+    </ItemGroup>
+    <RemoveDir Directories="$(ModStaging)" />
+    <Copy SourceFiles="@(ModFiles)" DestinationFolder="$(ModStaging)" />
+    <Copy SourceFiles="@(ModAssets)" DestinationFiles="@(ModAssets->'$(ModStaging)assets/%(RecursiveDir)%(Filename)%(Extension)')" />
+    <MakeDir Directories="$(MSBuildThisFileDirectory)../../dist" />
+    <Delete Files="$(ModZip)" />
+    <ZipDirectory SourceDirectory="$(ModStaging)" DestinationFile="$(ModZip)" />
+    <Message Importance="high" Text="Mod packagé : $(ModZip)" />
+  </Target>
+</Project>

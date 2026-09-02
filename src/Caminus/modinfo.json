@@ -1,0 +1,15 @@
+{
+  "type": "code",
+  "modid": "caminus",
+  "name": "Caminus",
+  "authors": ["Pixnop"],
+  "description": "Real building thermal simulation: rooms have a temperature, hearths heat them, walls leak by material, chimneys draw.",
+  "version": "0.1.0",
+  "side": "Universal",
+  "requiredOnClient": false,
+  "requiredOnServer": true,
+  "dependencies": {
+    "game": "1.22.7",
+    "survival": "1.22.7"
+  }
+}

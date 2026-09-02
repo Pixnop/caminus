@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Caminus.Core/Caminus.Core.csproj" />
+    <Project Path="src/Caminus/Caminus.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Caminus.Core.Tests/Caminus.Core.Tests.csproj" />
+  </Folder>
+</Solution>
