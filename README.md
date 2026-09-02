@@ -1,24 +1,24 @@
 # Caminus
 
-Simulation thermique du bâtiment pour Vintage Story. Chaque pièce a une température, le foyer la
-chauffe, les murs fuient selon leur matériau, la cheminée tire. La conservation des aliments et le
-confort du joueur suivent la température réelle.
+Building thermal simulation for Vintage Story. Each room has a temperature, the firepit heats it,
+walls leak according to their material, the chimney draws. Food spoilage and player comfort follow
+the actual temperature.
 
-Statut : lot 1 en cours (voir `docs/decoupage-lots.md`). Cible : Vintage Story 1.22.7, .NET 10.
+Status: milestone 1 in progress (see `docs/roadmap.md`). Target: Vintage Story 1.22.7, .NET 10.
 
-## Compiler
+## Build
 
 ```bash
-export VINTAGE_STORY=/chemin/vers/vintagestory   # dossier contenant VintagestoryAPI.dll
-dotnet build -c Release                            # produit dist/caminus_<version>.zip
+export VINTAGE_STORY=/path/to/vintagestory   # folder containing VintagestoryAPI.dll
+dotnet build -c Release                            # produces dist/caminus_<version>.zip
 dotnet test
 ```
 
-`tools/deploy.sh` compile et copie le zip dans le dossier `Mods` d'un profil de test.
+`tools/deploy.sh` builds and copies the zip into the `Mods` folder of a test profile.
 
 ## Structure
 
-- `src/Caminus.Core` : moteur thermique pur (réseau nodal RC, Euler implicite), sans dépendance au jeu.
-- `src/Caminus` : le mod, adaptateur entre le jeu et le moteur.
-- `tests/Caminus.Core.Tests` : tests du moteur.
-- `docs/` : faisabilité, vérification de l'API 1.22.7, recherche ModDB, découpage en lots.
+- `src/Caminus.Core`: pure thermal engine (nodal RC network, implicit Euler), no dependency on the game.
+- `src/Caminus`: the mod, the adapter between the game and the engine.
+- `tests/Caminus.Core.Tests`: engine tests.
+- `docs/`: feasibility study, 1.22.7 API verification, ModDB survey, milestone roadmap.

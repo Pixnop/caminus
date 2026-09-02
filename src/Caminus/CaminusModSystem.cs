@@ -1,4 +1,5 @@
 using Vintagestory.API.Common;
+using Vintagestory.API.MathTools;
 using Vintagestory.API.Server;
 
 namespace Caminus;
@@ -13,19 +14,23 @@ public class CaminusModSystem : ModSystem
     public override void StartServerSide(ICoreServerAPI api)
     {
         api.ChatCommands.GetOrCreate("caminus")
-            .WithDescription("Caminus : simulation thermique du bâtiment")
+            .WithDescription("Caminus: building thermal simulation")
             .RequiresPrivilege(Privilege.chat)
             .BeginSubCommand("version")
-                .WithDescription("Version du mod")
+                .WithDescription("Mod version")
                 .HandleWith(_ => TextCommandResult.Success($"Caminus {Mod.Info.Version}"))
             .EndSubCommand()
             .BeginSubCommand("temp")
-                .WithDescription("Bilan thermique de la pièce où vous êtes")
-                .RequiresPlayer()
+                .WithDescription("Thermal report of the room you are in (or at the given position)")
+                .WithArgs(api.ChatCommands.Parsers.OptionalWorldPosition("pos"))
                 .HandleWith(args =>
-                    api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetReport(args.Caller.Entity.Pos.AsBlockPos, out string report)
+                {
+                    BlockPos? pos = (args[0] as Vec3d)?.AsBlockPos ?? args.Caller.Entity?.Pos.AsBlockPos;
+                    if (pos == null) return TextCommandResult.Error("Position required from the console: /caminus temp x y z");
+                    return api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetReport(pos, out string report)
                         ? TextCommandResult.Success(report)
-                        : TextCommandResult.Success("Pas de pièce détectée ici."))
+                        : TextCommandResult.Success("No room detected here.");
+                })
             .EndSubCommand();
     }
 }

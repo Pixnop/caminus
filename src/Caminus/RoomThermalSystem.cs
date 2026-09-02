@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Caminus.Core;
 using Vintagestory.API.Common;
@@ -7,14 +8,14 @@ using Vintagestory.GameContent;
 
 namespace Caminus;
 
-/// <summary>assets/caminus/config/thermal.json. Unités SI.</summary>
+/// <summary>assets/caminus/config/thermal.json. SI units.</summary>
 public class ThermalConfig
 {
     public int TickMs { get; set; } = 1000;
     public double WattsPerHeatStrength { get; set; } = 400;
-    /// <summary>Capacité = volume × 1,2 kg/m³ × 1005 J/kg/K × ce facteur (mobilier et parois intérieures).</summary>
+    /// <summary>Capacity = volume × 1.2 kg/m³ × 1005 J/kg/K × this factor (furniture and interior walls).</summary>
     public double AirCapacityFactor { get; set; } = 5;
-    /// <summary>W/K par m² de face ouverte (porte, fenêtre, trou).</summary>
+    /// <summary>W/K per m² of open face (door, window, hole).</summary>
     public double OpeningConductance { get; set; } = 30;
     public double RoomForgetSeconds { get; set; } = 300;
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
@@ -23,12 +24,12 @@ public class ThermalConfig
 }
 
 /// <summary>
-/// Simulation thermique des pièces où se trouvent des joueurs. Serveur uniquement : RoomRegistry
-/// n'est pas thread-safe, tout se fait sur le thread principal.
+/// Thermal simulation of the rooms players are in. Server side only: RoomRegistry
+/// is not thread-safe, everything runs on the main thread.
 /// </summary>
 public class RoomThermalSystem : ModSystem
 {
-    private const double AirVolumetricCapacity = 1.2 * 1005; // J/K par m³ d'air
+    private const double AirVolumetricCapacity = 1.2 * 1005; // J/K per m³ of air
 
     private sealed class Geometry
     {
@@ -65,10 +66,10 @@ public class RoomThermalSystem : ModSystem
     {
         sapi = api;
         config = api.Assets.Get("caminus:config/thermal.json").ToObject<ThermalConfig>();
-        api.Logger.Notification("[Caminus] config : tick {0} ms, {1} W par unité de chaleur, {2} matériaux de paroi",
+        api.Logger.Notification("[Caminus] config: tick {0} ms, {1} W per heat unit, {2} wall materials",
             config.TickMs, config.WattsPerHeatStrength, config.WallU.Count);
         rooms = api.ModLoader.GetModSystem<RoomRegistry>();
-        api.Event.RegisterGameTickListener(OnTick, ex => api.Logger.Error("[Caminus] tick thermique : {0}", ex), config.TickMs);
+        api.Event.RegisterGameTickListener(OnTick, ex => api.Logger.Error("[Caminus] thermal tick: {0}", ex), config.TickMs);
     }
 
     private void OnTick(float dtRealSeconds)
@@ -94,9 +95,9 @@ public class RoomThermalSystem : ModSystem
             network.SetEdgeConductance(e.Edge, e.Geom.Conductance);
         }
 
-        // Le pas est en secondes de JEU : la chaleur d'un bâtiment évolue à l'échelle des journées
-        // de jeu, pas des minutes réelles. SpeedOfTime × CalendarSpeedMul = 60 × 0,5 par défaut,
-        // soit 30 s de jeu par seconde réelle (GameCalendar.cs:303).
+        // The step is in GAME seconds: a building's heat evolves on the scale of game days,
+        // not real-world minutes. SpeedOfTime × CalendarSpeedMul = 60 × 0.5 by default,
+        // i.e. 30 game seconds per real second (GameCalendar.cs:303).
         double dt = dtRealSeconds * sapi.World.Calendar.SpeedOfTime * sapi.World.Calendar.CalendarSpeedMul;
         if (dt <= 0) return;
         network!.Step(dt);
@@ -132,8 +133,8 @@ public class RoomThermalSystem : ModSystem
         if (entries.TryGetValue(key, out RoomEntry? e))
         {
             e.LastSeenMs = nowMs;
-            // Même bbox mais autre instance : le registre a été invalidé par un ChunkDirty, donc un
-            // bloc a bougé. La géométrie est refaite, la température conservée.
+            // Same bbox but a different instance: the registry was invalidated by a ChunkDirty, so a
+            // block moved. The geometry is rebuilt, the temperature is kept.
             if (ReferenceEquals(e.Room, room)) return;
             e.Room = room;
             e.Geom = Measure(room, dim);
@@ -150,7 +151,7 @@ public class RoomThermalSystem : ModSystem
             LastSeenMs = nowMs,
             Dimension = dim,
             OutsideTemperature = ClimateTemperature(c, dim) ?? 10,
-            Temperature = ClimateTemperature(c, dim) ?? 10, // une pièce neuve démarre à la température extérieure
+            Temperature = ClimateTemperature(c, dim) ?? 10, // a new room starts at the outside temperature
         };
         dirty = true;
     }
@@ -162,21 +163,21 @@ public class RoomThermalSystem : ModSystem
         {
             e.Node = net.AddNode(Math.Max(1, e.Geom.Volume * AirVolumetricCapacity * config.AirCapacityFactor), e.Temperature);
             e.OutsideNode = net.AddFixedNode(e.OutsideTemperature);
-            // Lot 1 : toutes les pertes vont vers l'extérieur, pas d'arête pièce-pièce.
+            // Batch 1: all losses go outside, no room-to-room edge.
             e.Edge = net.AddEdge(e.Node, e.OutsideNode, e.Geom.Conductance);
         }
         network = net;
         dirty = false;
     }
 
-    /// <summary>Parcours de la bbox : volume, parois par matériau et ouvertures. 1 m² par face.</summary>
-    // ponytail : O(bbox × 6) avec un GetBlock par face, refait seulement quand la pièce change.
+    /// <summary>Walks the bbox: volume, walls by material, and openings. 1 m² per face.</summary>
+    // ponytail: O(bbox × 6) with one GetBlock per face, redone only when the room changes.
     private Geometry Measure(Room room, int dim)
     {
         var geom = new Geometry();
         Cuboidi c = room.Location;
         IBlockAccessor acc = sapi.World.BlockAccessor;
-        // Room.Location contient des coordonnées brutes (RoomRegistry.cs:359) : dimension explicite.
+        // Room.Location holds raw coordinates (RoomRegistry.cs:359): explicit dimension.
         var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, dim);
         BlockPos nb = pos.Copy();
 
@@ -200,7 +201,7 @@ public class RoomThermalSystem : ModSystem
         }
     }
 
-    /// <summary>Face d'un bloc d'air vers l'extérieur de la pièce : paroi (bloc solide côté pièce) ou ouverture.</summary>
+    /// <summary>Face of an air block toward the outside of the room: wall (solid block on the room side) or opening.</summary>
     private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face)
     {
         Block block = acc.GetBlock(nb);
@@ -210,8 +211,8 @@ public class RoomThermalSystem : ModSystem
         geom.Walls[mat] = (prev.Faces + 1, prev.WPerK + config.UFor(mat));
     }
 
-    /// <summary>Sources de chaleur de la bbox élargie d'un bloc. Réévalué à chaque tick : un foyer s'éteint.</summary>
-    // ponytail : jusqu'à 16³ GetBlock par pièce et par seconde ; passer par un cache de positions de sources invalidé sur ChunkDirty si ça pèse.
+    /// <summary>Heat sources in the bbox expanded by one block. Re-evaluated every tick: a firepit can go out.</summary>
+    // ponytail: up to 16³ GetBlock calls per room per second; switch to a cache of source positions invalidated on ChunkDirty if this gets heavy.
     private double SourceWatts(Room room, int dim)
     {
         Cuboidi c = room.Location;
@@ -230,7 +231,7 @@ public class RoomThermalSystem : ModSystem
 
     private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Location, e.Dimension) ?? e.OutsideTemperature;
 
-    /// <summary>null si la région n'est pas chargée : l'appelant garde la valeur précédente.</summary>
+    /// <summary>null if the region isn't loaded: the caller keeps the previous value.</summary>
     private double? ClimateTemperature(Cuboidi c, int dim) =>
         sapi.World.BlockAccessor.GetClimateAt(new BlockPos((c.MinX + c.MaxX) / 2, (c.MinY + c.MaxY) / 2, (c.MinZ + c.MaxZ) / 2, dim),
             EnumGetClimateMode.NowValues)?.Temperature;
@@ -243,17 +244,20 @@ public class RoomThermalSystem : ModSystem
 
         Geometry g = e.Geom;
         double dT = e.Temperature - e.OutsideTemperature;
+        // Invariant culture: the report is also parsed by integration scenarios, a decimal
+        // separator that changes with the server locale would make the format unstable.
+        CultureInfo c = CultureInfo.InvariantCulture;
         var sb = new StringBuilder();
-        sb.AppendLine($"Pièce : {e.Temperature:0.0} °C, extérieur {e.OutsideTemperature:0.0} °C");
-        sb.AppendLine($"Volume {g.Volume} blocs, capacité {g.Volume * AirVolumetricCapacity * config.AirCapacityFactor / 1000:0} kJ/K");
-        sb.AppendLine($"Sources : {e.SourceWatts:0} W");
-        sb.AppendLine($"Pertes : {g.Conductance:0.0} W/K, soit {g.Conductance * dT:0} W à l'écart actuel");
+        sb.Append(c, $"Room: {e.Temperature:0.0} °C, outside {e.OutsideTemperature:0.0} °C").AppendLine();
+        sb.Append(c, $"Volume {g.Volume} blocks, capacity {g.Volume * AirVolumetricCapacity * config.AirCapacityFactor / 1000:0} kJ/K").AppendLine();
+        sb.Append(c, $"Sources: {e.SourceWatts:0} W").AppendLine();
+        sb.Append(c, $"Losses: {g.Conductance:0.0} W/K, i.e. {g.Conductance * dT:0} W at the current delta").AppendLine();
         foreach (var (mat, w) in g.Walls.OrderByDescending(w => w.Value.WPerK))
-            sb.AppendLine($"  {mat} : {w.Faces} faces, {w.WPerK:0.0} W/K, {w.WPerK * dT:0} W");
+            sb.Append(c, $"  {mat}: {w.Faces} faces, {w.WPerK:0.0} W/K, {w.WPerK * dT:0} W").AppendLine();
         if (g.Openings > 0)
         {
             double w = g.Openings * config.OpeningConductance;
-            sb.AppendLine($"  Ouvertures : {g.Openings} faces, {w:0.0} W/K, {w * dT:0} W");
+            sb.Append(c, $"  Openings: {g.Openings} faces, {w:0.0} W/K, {w * dT:0} W").AppendLine();
         }
         report = sb.ToString().TrimEnd();
         return true;

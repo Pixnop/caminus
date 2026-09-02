@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <RootNamespace>Caminus</RootNamespace>
-    <Description>Simulation thermique du bâtiment pour Vintage Story.</Description>
+    <Description>Building thermal simulation for Vintage Story.</Description>
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <GenerateDependencyFile>false</GenerateDependencyFile>
   </PropertyGroup>
@@ -25,7 +25,7 @@
     <Content Include="assets/**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
-  <!-- Zip du mod : dll + modinfo + assets, dans dist/ à la racine du dépôt. -->
+  <!-- Mod zip: dll + modinfo + assets, into dist/ at the repo root. -->
   <Target Name="PackageMod" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
     <PropertyGroup>
       <ModStaging>$(IntermediateOutputPath)modzip/</ModStaging>
@@ -41,6 +41,6 @@
     <MakeDir Directories="$(MSBuildThisFileDirectory)../../dist" />
     <Delete Files="$(ModZip)" />
     <ZipDirectory SourceDirectory="$(ModStaging)" DestinationFile="$(ModZip)" />
-    <Message Importance="high" Text="Mod packagé : $(ModZip)" />
+    <Message Importance="high" Text="Mod packaged: $(ModZip)" />
   </Target>
 </Project>

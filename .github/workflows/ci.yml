@@ -62,9 +62,19 @@ jobs:
         env:
           VINTAGE_STORY: /home/runner/vintagestory
         run: >
-          dotnet test --no-build -c Release
+          dotnet test tests/Caminus.Core.Tests --no-build -c Release
           --collect:"XPlat Code Coverage"
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+
+      # Atlas scenarios: 1.22.7 server embedded in dotnet test. No coverage (the project
+      # is already in sonar.coverage.exclusions via tests/**), and the Atlas package itself
+      # takes care of copying the game's Newtonsoft.Json over the test SDK's, hence VINTAGE_STORY
+      # being required for both build and run.
+      - name: Scenarios
+        timeout-minutes: 15
+        env:
+          VINTAGE_STORY: /home/runner/vintagestory
+        run: dotnet test tests/Caminus.Scenarios --no-build -c Release
 
       - name: Sonar end
         if: env.SONAR_TOKEN != ''

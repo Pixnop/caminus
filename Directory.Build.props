@@ -7,7 +7,7 @@
     <Version>0.1.0</Version>
     <Authors>Pixnop</Authors>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <!-- Dossier du jeu (VintagestoryAPI.dll, Mods/VSEssentials.dll...). Défaut : variable d'environnement VINTAGE_STORY. -->
+    <!-- Game folder (VintagestoryAPI.dll, Mods/VSEssentials.dll...). Default: VINTAGE_STORY environment variable. -->
     <VintageStoryDir Condition="'$(VintageStoryDir)' == ''">$(VINTAGE_STORY)</VintageStoryDir>
   </PropertyGroup>
 </Project>

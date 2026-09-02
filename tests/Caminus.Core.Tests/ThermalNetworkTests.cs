@@ -4,9 +4,9 @@ namespace Caminus.Core.Tests;
 
 public class ThermalNetworkTests
 {
-    // 1. Équilibre analytique : un nœud libre entre deux fixes, avec source.
+    // 1. Analytical equilibrium: one free node between two fixed nodes, with a source.
     [Fact]
-    public void Equilibre_ConvergeVersLaMoyennePondereeAvecSource()
+    public void Equilibrium_ConvergesToWeightedMeanWithSource()
     {
         const double t1 = -5, t2 = 20, g1 = 3, g2 = 7, q = 40;
         var net = new ThermalNetwork();
@@ -22,9 +22,9 @@ public class ThermalNetworkTests
         Assert.Equal((g1 * t1 + g2 * t2 + q) / (g1 + g2), net.GetTemperature(n), 1e-6);
     }
 
-    // 2. Constante de temps : après t = τ, l'écart est réduit d'un facteur e.
+    // 2. Time constant: after t = τ, the gap is reduced by a factor of e.
     [Fact]
-    public void ConstanteDeTemps_ApresTau_EcartDiviseParE()
+    public void TimeConstant_AfterTau_GapDividedByE()
     {
         const double c = 2000, g = 4, t0 = 30, tf = 10;
         double tau = c / g;
@@ -39,9 +39,9 @@ public class ThermalNetworkTests
         Assert.Equal(attendu, net.GetTemperature(n), 0.01 * Math.Abs(attendu));
     }
 
-    // 3. Stabilité : un pas énorme reste borné et ne diverge pas.
+    // 3. Stability: a huge step stays bounded and does not diverge.
     [Fact]
-    public void GrandPas_UnSeulStep_ResteBorneEtProcheDuFixe()
+    public void HugeStep_SingleStep_StaysBoundedAndCloseToFixed()
     {
         const double c = 2000, g = 4, t0 = 30, tf = 10;
         double tau = c / g;
@@ -58,9 +58,9 @@ public class ThermalNetworkTests
         Assert.Equal(tf, t, 1e-3);
     }
 
-    // 4. Conservation : système fermé, Σ C·T invariant, convergence vers la moyenne pondérée.
+    // 4. Conservation: closed system, Σ C·T invariant, converges to the weighted mean.
     [Fact]
-    public void SystemeFerme_ConserveLEnergieEtConvergeVersLaMoyenne()
+    public void ClosedSystem_ConservesEnergyAndConvergesToTheMean()
     {
         const double ca = 1000, cb = 3000, ta = 50, tb = 10;
         var net = new ThermalNetwork();
@@ -81,9 +81,9 @@ public class ThermalNetworkTests
         Assert.Equal(moyenne, net.GetTemperature(b), 1e-6);
     }
 
-    // 5. Nœud fixe : immuable, et insensible à SetSourcePower.
+    // 5. Fixed node: immutable, and unaffected by SetSourcePower.
     [Fact]
-    public void NoeudFixe_NeBougePasEtIgnoreLesSources()
+    public void FixedNode_DoesNotMoveAndIgnoresSources()
     {
         var net = new ThermalNetwork();
         int f = net.AddFixedNode(-10);
@@ -96,7 +96,7 @@ public class ThermalNetworkTests
         for (int i = 0; i < 100; i++) net.Step(1);
         Assert.Equal(-10.0, net.GetTemperature(f));
 
-        // Référence sans la source parasite : le reste du réseau est identique.
+        // Reference without the parasitic source: the rest of the network is identical.
         var temoin = new ThermalNetwork();
         int ft = temoin.AddFixedNode(-10);
         int nt = temoin.AddNode(1000, 20);
@@ -105,9 +105,9 @@ public class ThermalNetworkTests
         Assert.Equal(temoin.GetTemperature(nt), net.GetTemperature(n), 1e-12);
     }
 
-    // 6. Flux : signe, valeur, et cohérence avec la conductance courante.
+    // 6. Flow: sign, value, and consistency with the current conductance.
     [Fact]
-    public void FluxArete_SigneEtValeur()
+    public void EdgeFlow_SignAndValue()
     {
         var net = new ThermalNetwork();
         int chaud = net.AddNode(1000, 30);
@@ -115,27 +115,27 @@ public class ThermalNetworkTests
         int e = net.AddEdge(chaud, froid, 2.5);
 
         Assert.Equal((chaud, froid), net.GetEdgeNodes(e));
-        Assert.Equal(2.5 * 20, net.GetEdgeHeatFlow(e), 1e-12); // A plus chaud → flux positif
+        Assert.Equal(2.5 * 20, net.GetEdgeHeatFlow(e), 1e-12); // A hotter → positive flow
 
         net.SetEdgeConductance(e, 5);
         Assert.Equal(5.0, net.GetEdgeConductance(e));
         Assert.Equal(5 * 20, net.GetEdgeHeatFlow(e), 1e-12);
 
-        // Sens inverse : flux négatif.
+        // Reverse direction: negative flow.
         var inverse = new ThermalNetwork();
         int a = inverse.AddNode(1000, 10);
         int b = inverse.AddNode(1000, 30);
         int e2 = inverse.AddEdge(a, b, 2.5);
         Assert.Equal(-2.5 * 20, inverse.GetEdgeHeatFlow(e2), 1e-12);
 
-        // Conductance nulle : pas de flux.
+        // Zero conductance: no flow.
         inverse.SetEdgeConductance(e2, 0);
         Assert.Equal(0.0, inverse.GetEdgeHeatFlow(e2));
     }
 
-    // 7. Indépendance au pas : 100 s en pas de 1 s ou de 0,1 s, à 2 % près.
+    // 7. Step independence: 100 s in steps of 1 s or 0.1 s, within 2%.
     [Fact]
-    public void ResultatQuasiIndependantDuPas()
+    public void ResultAlmostIndependentOfStepSize()
     {
         static double Simule(double dt)
         {
@@ -152,9 +152,9 @@ public class ThermalNetworkTests
         Assert.Equal(fin, gros, 0.02 * Math.Abs(fin));
     }
 
-    // 8. Arguments invalides.
+    // 8. Invalid arguments.
     [Fact]
-    public void ArgumentsInvalides_Levent()
+    public void InvalidArguments_Throw()
     {
         var net = new ThermalNetwork();
         int f = net.AddFixedNode(0);
@@ -172,9 +172,9 @@ public class ThermalNetworkTests
         Assert.Throws<ArgumentOutOfRangeException>(() => net.GetEdgeConductance(99));
     }
 
-    // Une arête entre deux nœuds fixes est acceptée et sans effet.
+    // An edge between two fixed nodes is accepted and has no effect.
     [Fact]
-    public void AreteEntreDeuxFixes_AccepteeEtSansEffet()
+    public void EdgeBetweenTwoFixedNodes_AcceptedAndHasNoEffect()
     {
         var net = new ThermalNetwork();
         int f1 = net.AddFixedNode(0);
@@ -187,6 +187,6 @@ public class ThermalNetworkTests
 
         Assert.Equal(0.0, net.GetTemperature(f1));
         Assert.Equal(100.0, net.GetTemperature(f2));
-        Assert.Equal(0, net.GetTemperature(n), 1e-6); // n ne voit que f1
+        Assert.Equal(0, net.GetTemperature(n), 1e-6); // n only sees f1
     }
 }

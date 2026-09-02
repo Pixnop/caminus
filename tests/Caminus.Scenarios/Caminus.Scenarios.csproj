@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Pixnop.Atlas.XUnit" Version="0.11.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The mod under test. AtlasMod=true writes its output folder (modinfo.json + assets/ +
+         Caminus.Core.dll next to Caminus.dll) into atlas-mods.generated.txt: the embedded
+         server loads it as a "folder" mod. -->
+    <ProjectReference Include="../../src/Caminus/Caminus.csproj">
+      <AtlasMod>true</AtlasMod>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI"><HintPath>$(VintageStoryDir)/VintagestoryAPI.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VSSurvivalMod"><HintPath>$(VintageStoryDir)/Mods/VSSurvivalMod.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
