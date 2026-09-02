@@ -13,7 +13,7 @@ namespace Caminus.Scenarios;
 /// Batch 1 integration scenarios: the mod runs inside a real embedded 1.22.7 server (Atlas),
 /// rooms are built by hand and the <c>/caminus temp</c> report is read.
 /// </summary>
-public class ThermalScenarios : AtlasScenarioBase
+public partial class ThermalScenarios : AtlasScenarioBase
 {
     // Stone without BreakIfFloating or UnstableRock (rock-* has it): a box in mid-air does not collapse.
     private const string Stone = "game:cobblestone-granite";
@@ -29,8 +29,11 @@ public class ThermalScenarios : AtlasScenarioBase
     /// <summary>5×5×5 box: solid shell, interior air volume 3×3×3 (27 blocks, 54 faces).</summary>
     private const int Inner = 3;
 
-    private static readonly Regex RoomTemp = new(@"Room: (-?\d+(?:\.\d+)?) °C", RegexOptions.Compiled);
-    private static readonly Regex Losses = new(@"Losses: (-?\d+(?:\.\d+)?) W/K", RegexOptions.Compiled);
+    [GeneratedRegex(@"Room: (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex RoomTemp();
+
+    [GeneratedRegex(@"Losses: (-?\d+(?:\.\d+)?) W/K")]
+    private static partial Regex Losses();
 
     [AtlasScenario]
     public async Task Version_command_answers()
@@ -59,7 +62,7 @@ public class ThermalScenarios : AtlasScenarioBase
         await World.Ticks(300); // ≈ 10 real seconds
 
         string after = await ReportAt(inside);
-        double t0 = Read(RoomTemp, before), t1 = Read(RoomTemp, after);
+        double t0 = Read(RoomTemp(), before), t1 = Read(RoomTemp(), after);
         Assert.True(t1 - t0 >= 2.0, $"the room only gained {t1 - t0:0.00} K\nbefore:\n{before}\nafter:\n{after}");
         Assert.Contains("Sources: 4000 W", after);
     }
@@ -77,7 +80,7 @@ public class ThermalScenarios : AtlasScenarioBase
         string opened = await WaitForRoomReport(inside, r => r.Contains("Openings"));
 
         Assert.Contains("Openings: 1 faces", opened);
-        double gain = Read(Losses, opened) - Read(Losses, closed);
+        double gain = Read(Losses(), opened) - Read(Losses(), closed);
         Assert.True(Math.Abs(gain - 27.0) < 0.1, $"conductance +{gain:0.0} W/K instead of +27\nclosed:\n{closed}\nopen:\n{opened}");
     }
 
@@ -92,7 +95,7 @@ public class ThermalScenarios : AtlasScenarioBase
 
         Assert.Contains("Stone: 54 faces", stoneReport);
         Assert.Contains("Wood: 54 faces", woodReport);
-        Assert.True(Read(Losses, woodReport) < Read(Losses, stoneReport),
+        Assert.True(Read(Losses(), woodReport) < Read(Losses(), stoneReport),
             $"stone:\n{stoneReport}\nwood:\n{woodReport}");
     }
 
