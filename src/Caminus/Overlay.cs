@@ -83,6 +83,7 @@ public class OverlayServer : ModSystem
             (List<BlockPos> blocks, List<int> colors) = Highlights(flows);
             sapi.World.HighlightBlocks(player, Slot, blocks, colors);
             SpawnFlowParticles(flows);
+            SpawnFlueParticles(flows);
             double? body = player.Entity.GetBehavior<EntityBehaviorCaminusBodyTemperature>()?.CurBodyTemperature;
             channel.SendPacket(new OverlayPacket { Text = Describe(flows, pos.Y, body) }, player);
         }
@@ -110,6 +111,12 @@ public class OverlayServer : ModSystem
             blocks.Add(f.Face.Pos);
             (int r, int g, int b) = Rgb(f);
             colors.Add(ColorUtil.ColorFromRgba(r, g, b, (int)(255 * Alpha(f.Watts, max))));
+        }
+        // The stack itself, above the envelope: orange, and dim while it draws nothing.
+        foreach (BlockPos p in flows.Draft?.Blocks ?? [])
+        {
+            blocks.Add(p);
+            colors.Add(ColorUtil.ColorFromRgba(255, 150, 30, (int)(255 * (flows.Draft!.Flow > 0 ? 0.75 : MinAlpha))));
         }
         return (blocks, colors);
     }
@@ -164,6 +171,22 @@ public class OverlayServer : ModSystem
         }
     }
 
+    /// <summary>Orange puffs climbing the stack, as fast as the draft is strong.</summary>
+    private void SpawnFlueParticles(RoomFlows flows)
+    {
+        if (flows.Draft is not { Flow: > 0 } draft) return;
+        // A m³/s through a one-block flue IS a metre per second, so the flow per column is the speed.
+        var speed = new Vec3f(0, (float)Math.Min(3, draft.Flow / Math.Max(1, draft.Columns)), 0);
+        foreach (BlockPos p in draft.Blocks)
+            sapi.World.SpawnParticles(new SimpleParticleProperties(1, 2,
+                ColorUtil.ToRgba(180, 255, 150, 30),
+                new Vec3d(p.X + 0.35, p.Y + 0.2, p.Z + 0.35), new Vec3d(p.X + 0.65, p.Y + 0.4, p.Z + 0.65),
+                speed, speed, 1.5f, 0f, 0.2f, 0.4f, EnumParticleModel.Quad)
+            {
+                WithTerrainCollision = false,
+            });
+    }
+
     /// <summary>
     /// The three HUD lines. <paramref name="eyeY"/> is the block the player is looking out of.
     /// Public and pure, same reason as <see cref="Highlights"/>.
@@ -188,7 +211,11 @@ public class OverlayServer : ModSystem
         sb.AppendLine();
         sb.Append(c, $"Wind {wind:0.00} from the {RoomThermalSystem.ComesFrom(flows.Wind)} at {flows.WindTemperature:0.0} °C");
         if (flows.ForestDensity > 0) sb.Append(c, $"   forest {flows.ForestDensity:0.00}");
-        sb.Append(c, $"   sun {flows.SolarWatts:+0;-0;0} W").AppendLine();
+        sb.Append(c, $"   sun {flows.SolarWatts:+0;-0;0} W");
+        if (flows.Draft is { Blocked: false } drawing) sb.Append(c, $"   flue {drawing.Height} m");
+        else if (flows.Draft != null) sb.Append("   flue blocked");
+        if (flows.Smoke > 0.1 || flows.SmokeSources > 0) sb.Append(c, $"   smoke {Chimney.Level(flows.Smoke)}");
+        sb.AppendLine();
         // Faces count heat leaving as positive; the player reads a room that loses heat as negative.
         sb.Append(c, $"Floor {Local(flows, floorY):0.0} °C   eyes {Local(flows, eyeY):0.0} °C   " +
                      $"ceiling {Local(flows, ceilingY):0.0} °C   net {-watts:0} W");

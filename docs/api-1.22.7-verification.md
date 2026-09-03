@@ -372,6 +372,53 @@ after pinning the body at `NormalBodyTemperature` (l.228). Any body temperature 
 `/gamemode <name> survival` first. The embedded server also accepts 16 clients with no queue and test
 players never leave, so scenarios that join extra players have to `IServerPlayer.Disconnect()` them.
 
+## 14. The chimney block, smoke sources and damage (verified 2026-09-03)
+
+### The block: two JSON files share the base code
+
+`assets/survival/blocktypes/clay/chimneycourse.json` (`code: "claybrickchimney"`) is what a player
+places today: `behaviors: [{name: "Chimney"}, {name: "NWOrientable"}]`,
+`variantgroups: [{code: "courses", states: ["four"]}, {code: "type", states: [...7 colours]},
+{code: "orientation", states: ["ns", "we"]}]`. A single `courses` state means every variant code
+carries `-four-`, e.g. `claybrickchimney-four-red-ns` (`ThermalScenarios.Chimney`). Its `sidesolid`
+is `{ all: false, down: true }` and `sideopaque: { all: false }`: solid only on its bottom face, which
+is exactly what makes the vanilla `RoomRegistry` flood fill treat it as a ceiling (closes the room)
+while every other face stays open (so the block itself is never part of the room's own air volume).
+
+`assets/survival/blocktypes/legacy/chimney.json` reuses the same `code: "claybrickchimney"` for its
+old `type/state/orientation` variants (no `courses` segment, so no `-four-` in the code) and carries
+`behaviors: [{name: "NoParticles"}, {name: "NWOrientable"}]`, i.e. no `Chimney` behavior at all and
+`sidesolid: { all: false }` (not even the bottom face). `RoomThermalSystem.BuildFlues` keys off
+`BlockBehaviorChimney` (with inheritance), not the block code or domain, so only the current variant
+detects as a flue; the legacy one is inert to Caminus, matching how it behaves for the vanilla room
+registry (never closes anything on its own).
+
+### `ISmokeEmitter`: two implementers, both keyed on `IsBurning`
+
+`Vintagestory.GameContent.ISmokeEmitter` has one member, `bool EmitsSmoke(BlockPos pos)`. Across the
+decompiled `survival` assembly (`VSSurvivalMod.dll`) exactly two blocks implement it:
+
+- `BlockFirepit.EmitsSmoke` returns `(GetBlockEntity(pos) as BlockEntityFirepit)?.IsBurning ?? false`.
+- `BlockPitkiln.EmitsSmoke` returns `(GetBlockEntity(pos) as BlockEntityPitKiln)?.IsBurning ?? false`.
+
+Both answer `false` while unlit, so `ScanSources` only ever counts a source as smoking when it is
+also giving off heat: an unlit firepit contributes to neither `SourceWatts` nor `SmokeWatts`. Vanilla
+itself already reads this interface the same way: `BlockBehaviorChimney.ShouldReceiveClientParticleTicks`
+walks up to 8 blocks below a chimney looking for a solid block or an `ISmokeEmitter`, and only spawns
+the smoke-curl particle when `EmitsSmoke` is true. Caminus's own smoke model is server side and
+independent of that particle behavior, but it is the same signal.
+
+### Damage API
+
+`config.SmokeDamage` (default `false`) gates a call in `TrackPlayerRooms`:
+`sp.Entity.ReceiveDamage(new DamageSource { Source = EnumDamageSource.Block, Type =
+EnumDamageType.Suffocation }, SmokeDamagePerHit)`. `DamageSource` (`Vintagestory.API.Common`) is a
+plain settable-property class, `EnumDamageSource.Block` and `EnumDamageType.Suffocation` both exist in
+1.22.7 (`EnumDamageSource.cs`, `EnumDamageType.cs`); no Harmony or reflection needed, this is a public
+entity API call available since long before this version. The tick gate (`SmokeDamageTicks = 10`, at
+the mod's 1 s tick) keeps it at 0.5 HP roughly every 10 s while a room stays at or above the heavy-smoke
+threshold, and it is off by default so a server owner opts in after judging the balance in play.
+
 ## Names cited from memory vs. reality
 
 | Cited | Real |

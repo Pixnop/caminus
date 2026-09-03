@@ -42,6 +42,16 @@ public class ThermalConfig
     public double ForestShade { get; set; } = 0.7;
     /// <summary>Share of the wind a fully forested position keeps off the walls.</summary>
     public double ForestShelter { get; set; } = 0.7;
+    /// <summary>Cd of the stack-effect flow, 0..1 (ASHRAE gives 0.6 for a plain opening).</summary>
+    public double DischargeCoefficient { get; set; } = 0.6;
+    /// <summary>Cracks around one square metre of envelope, m². This is what the draft pulls air through.</summary>
+    public double LeakageAreaPerFace { get; set; } = 0.003;
+    /// <summary>Share of a smoking source's power that goes straight up the flue instead of heating the room.</summary>
+    public double FlueLossFraction { get; set; } = 0.4;
+    /// <summary>Haze one smoking source adds per hour, in a room whose air is never renewed.</summary>
+    public double SmokePerSourcePerHour { get; set; } = 2.0;
+    /// <summary>Whether heavy smoke hurts. Off by default: the server owner decides after playing.</summary>
+    public bool SmokeDamage { get; set; }
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
 
     public double UFor(EnumBlockMaterial mat) => WallU.TryGetValue(mat, out double u) ? u : 3.0;
@@ -60,11 +70,23 @@ public readonly record struct Face(BlockPos Pos, BlockFacing Facing, EnumBlockMa
 /// <summary>A face with what it is doing right now. Positive <paramref name="Watts"/> = heat leaving the room.</summary>
 public readonly record struct FaceFlow(Face Face, double Conductance, double Watts);
 
+/// <summary>
+/// One chimney stack rising from the room's ceiling. <paramref name="Columns"/> is its cross section
+/// in square metres (one block wide = 1 m²) and <paramref name="Height"/> the mean number of chimney
+/// blocks of its columns. Blocked means the stack ends under a roof, which draws nothing.
+/// </summary>
+public readonly record struct Flue(BlockPos Start, int Height, int Columns, int TopY, bool Blocked);
+
+/// <summary>What the room's chimneys are doing right now. Watts is negative: the draft takes heat out.</summary>
+public sealed record DraftState(int Height, int Columns, bool Blocked, double Flow, double Watts,
+    double InletArea, IReadOnlyList<BlockPos> Blocks);
+
 /// <summary>Everything a client overlay needs to draw one room. GroundTemperature is NaN if the room touches no ground.</summary>
 public sealed record RoomFlows(
     double Temperature, double OutsideTemperature, double GroundTemperature, double WindTemperature,
     Vec3d Wind, double Gradient, double YMid, double StratificationWatts, IReadOnlyList<FaceFlow> Faces,
-    double SolarWatts, double GeologicActivity, double ForestDensity);
+    double SolarWatts, double GeologicActivity, double ForestDensity,
+    DraftState? Draft, double Smoke, int SmokeSources);
 
 /// <summary>
 /// Thermal simulation of the rooms players are in. Server side only: RoomRegistry
@@ -80,6 +102,15 @@ public class RoomThermalSystem : ModSystem
     private const double NoRoomTtlHours = 60.0 / 3600;
     /// <summary>Ticks between two heat-source scans of a room nobody is standing in.</summary>
     private const int UnoccupiedSourceScanTicks = 10;
+    /// <summary>Ticks between two doses of smoke damage, at the 1 s tick.</summary>
+    private const int SmokeDamageTicks = 10;
+    private const float SmokeDamagePerHit = 0.5f;
+    /// <summary>Smoke above which the air is called heavy, and hurts when the config lets it.</summary>
+    private const double HeavySmoke = 0.4;
+    /// <summary>Air changes per hour an envelope leaks on its own, with no draft at all.</summary>
+    private const double BaseAirChanges = 0.3;
+    /// <summary>Blocks a flue may rise before we stop believing it is one.</summary>
+    private const int MaxFlueHeight = 64;
 
     private sealed class Geometry
     {
@@ -91,6 +122,25 @@ public class RoomThermalSystem : ModSystem
         /// <summary>Calm-air conductance toward the outside air, W/K.</summary>
         public double Conductance;
         public double GroundConductance;
+        /// <summary>
+        /// Area the draft can pull air in through, m²: cracks over the whole envelope, plus any real
+        /// opening at one square metre a face. An enclosed room has no opening, so today this is the
+        /// leakage alone; milestone 6's flood fill is what lets a room keep a hole and stay a room.
+        /// </summary>
+        public double InletArea;
+        /// <summary>Chimney blocks resting on the ceiling: the bottom of each column, before grouping.</summary>
+        public readonly List<BlockPos> ChimneyStarts = [];
+        /// <summary>One entry per chimney stack on the ceiling, blocked ones included.</summary>
+        public readonly List<Flue> Flues = [];
+        /// <summary>Every chimney block of every stack, for the overlay.</summary>
+        public readonly List<BlockPos> ChimneyBlocks = [];
+
+        /// <summary>Cross section that actually draws, m², i.e. the columns of the unblocked stacks.</summary>
+        public int FlueColumns;
+        /// <summary>Mean height of the drawing stacks, weighted by their section, m.</summary>
+        public double FlueHeight;
+        /// <summary>Top of the highest drawing stack.</summary>
+        public int FlueTopY;
 
         /// <summary>Mean burial depth of the ground faces, in metres (1 block = 1 m).</summary>
         public double GroundDepth => GroundFaces == 0 ? 0 : (double)GroundDepthSum / GroundFaces;
@@ -107,6 +157,18 @@ public class RoomThermalSystem : ModSystem
         public double SourceWatts;
         /// <summary>Sources further out, already attenuated by the rock between them and the room, W.</summary>
         public double NearbyWatts;
+        /// <summary>Share of <see cref="SourceWatts"/> that comes from a source making smoke, W.</summary>
+        public double SmokeWatts;
+        /// <summary>How many blocks in the room are emitting smoke right now.</summary>
+        public int SmokeSources;
+        /// <summary>Haze in the room, 0..1.</summary>
+        public double Smoke;
+        /// <summary>Stack-effect volume flow up the flue, m³/s.</summary>
+        public double DraftFlow;
+        /// <summary>What that flow costs the room, W/K, toward the outside air the inlet pulls in.</summary>
+        public double DraftConductance;
+        /// <summary>Correction for the draft taking ceiling air rather than mean air, W (negative).</summary>
+        public double DraftWatts;
         /// <summary>Wind above the roof, game units. Vanilla only ever fills X (see <see cref="WindAt"/>).</summary>
         public Vec3d Wind = new();
         /// <summary>Temperature of the air the wind brings in, sampled upwind.</summary>
@@ -142,6 +204,7 @@ public class RoomThermalSystem : ModSystem
         public int Edge = -1;
         public int WindNode = -1;
         public int WindEdge = -1;
+        public int DraftEdge = -1;
         public int GroundNode = -1;
         public int GroundEdge = -1;
     }
@@ -211,12 +274,15 @@ public class RoomThermalSystem : ModSystem
             if (e.HasPlayer || outer) ScanSources(e, outer);
             e.Ticks++;
             UpdateWindSunAndStratification(e);
+            UpdateDraftAndSmoke(e, dt);
 
             e.Net.SetTemperature(e.OutsideNode, e.OutsideTemperature);
-            e.Net.SetSourcePower(e.Node, e.SourceWatts + e.NearbyWatts + e.StratificationWatts + e.SolarWatts);
+            e.Net.SetSourcePower(e.Node, e.SourceWatts - FlueWatts(e) + e.NearbyWatts
+                                         + e.StratificationWatts + e.SolarWatts + e.DraftWatts);
             e.Net.SetEdgeConductance(e.Edge, e.Geom.Conductance);
             e.Net.SetTemperature(e.WindNode, e.WindTemperature);
             e.Net.SetEdgeConductance(e.WindEdge, e.WindConductance);
+            e.Net.SetEdgeConductance(e.DraftEdge, e.DraftConductance);
             if (e.GroundNode >= 0)
             {
                 e.Net.SetTemperature(e.GroundNode, e.GroundTemp);
@@ -250,7 +316,11 @@ public class RoomThermalSystem : ModSystem
             Room room = rooms.GetRoomForPosition(pos);
             if (!Enclosed(room)) continue;
             RoomEntry? e = Track(room, pos.dimension);
-            if (e != null) e.HasPlayer = true;
+            if (e == null) continue;
+            e.HasPlayer = true;
+            if (config.SmokeDamage && e.Smoke >= HeavySmoke && e.Ticks % SmokeDamageTicks == 0)
+                sp.Entity.ReceiveDamage(new DamageSource { Source = EnumDamageSource.Block, Type = EnumDamageType.Suffocation },
+                    SmokeDamagePerHit);
         }
     }
 
@@ -310,6 +380,9 @@ public class RoomThermalSystem : ModSystem
         // temperature it comes from; its edge carries only the extra conductance it causes.
         e.WindNode = net.AddFixedNode(e.WindTemperature);
         e.WindEdge = net.AddEdge(e.Node, e.WindNode, e.WindConductance);
+        // The draft pulls its make-up air in through the envelope, so it comes from the local outside
+        // air, not from upwind: same node as the fabric, a second edge whose conductance is the flow.
+        e.DraftEdge = net.AddEdge(e.Node, e.OutsideNode, e.DraftConductance);
         e.GroundNode = e.GroundEdge = -1;
         if (e.Geom.GroundFaces > 0)
         {
@@ -339,10 +412,76 @@ public class RoomThermalSystem : ModSystem
 
         foreach (Face f in geom.Faces)
         {
-            if (f.Ground) geom.GroundConductance += f.UA;
-            else geom.Conductance += f.UA;
+            if (f.Ground) { geom.GroundConductance += f.UA; continue; }
+            geom.Conductance += f.UA;
+            // A face open to the air is a whole square metre of inlet; a solid one only its cracks.
+            geom.InletArea += f.Opening ? 1 : config.LeakageAreaPerFace;
         }
+        BuildFlues(geom, acc);
         return geom;
+    }
+
+    /// <summary>
+    /// Turns the chimney blocks sitting on the ceiling into flues. Two stacks side by side are one
+    /// flue of twice the section, not two flues: what matters to the draft is the total area.
+    /// </summary>
+    private void BuildFlues(Geometry geom, IBlockAccessor acc)
+    {
+        var pending = new HashSet<BlockPos>(geom.ChimneyStarts);
+        while (pending.Count > 0)
+        {
+            BlockPos seed = pending.First();
+            pending.Remove(seed);
+            List<BlockPos> group = [seed];
+            for (int i = 0; i < group.Count; i++)
+                foreach (BlockFacing side in BlockFacing.HORIZONTALS)
+                {
+                    BlockPos n = group[i].AddCopy(side);
+                    if (pending.Remove(n)) group.Add(n);
+                }
+
+            int heightSum = 0, top = 0, open = 0;
+            foreach (BlockPos start in group)
+            {
+                (int height, int topY, bool sky) = WalkFlue(acc, start, geom.ChimneyBlocks);
+                heightSum += height;
+                if (!sky) continue;
+                open++;
+                top = Math.Max(top, topY);
+            }
+            geom.Flues.Add(new Flue(seed, (int)Math.Round((double)heightSum / group.Count), group.Count, top, open == 0));
+        }
+
+        foreach (Flue f in geom.Flues)
+        {
+            if (f.Blocked) continue;
+            geom.FlueColumns += f.Columns;
+            geom.FlueHeight += (double)f.Height * f.Columns;
+            geom.FlueTopY = Math.Max(geom.FlueTopY, f.TopY);
+        }
+        if (geom.FlueColumns > 0) geom.FlueHeight /= geom.FlueColumns;
+    }
+
+    /// <summary>
+    /// Walks one column of chimney blocks upward. It draws only if what sits on top is not solid and
+    /// sees the sky: <c>GetRainMapHeightAt</c> is the topmost block that stops rain at that x/z, so a
+    /// stack whose own top block is the highest thing there answers exactly its own Y, and a stack
+    /// under a roof answers the roof's. A cap laid straight on the stack fails the solidity test first.
+    /// </summary>
+    private static (int Height, int TopY, bool Sky) WalkFlue(IBlockAccessor acc, BlockPos start, List<BlockPos> blocks)
+    {
+        BlockPos p = start.Copy();
+        int height = 0;
+        while (height < MaxFlueHeight && acc.GetBlock(p)?.HasBehavior<BlockBehaviorChimney>(withInheritance: true) == true)
+        {
+            blocks.Add(p.Copy());
+            height++;
+            p.Up();
+        }
+        Block? above = acc.GetBlock(p);
+        bool sky = above != null && above.GetRetention(p, BlockFacing.DOWN, EnumRetentionType.Heat) == 0
+                   && acc.GetRainMapHeightAt(p) <= p.Y;
+        return (height, p.Y - 1, sky);
     }
 
     private void MeasureAirBlock(Geometry geom, Room room, IBlockAccessor acc, BlockPos pos, BlockPos nb)
@@ -368,6 +507,11 @@ public class RoomThermalSystem : ModSystem
             return;
         }
         EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
+        // The chimney block is sidesolid only downward, so the vanilla flood fill treats it as a
+        // ceiling and the room stays enclosed with the stack outside it. The behavior, not the block
+        // code: another mod's chimney draws just as well. Inheritance included, for subclasses of it.
+        if (face == BlockFacing.UP && block.HasBehavior<BlockBehaviorChimney>(withInheritance: true))
+            geom.ChimneyStarts.Add(nb.Copy());
 
         // GetTerrainMapheightAt, not GetRainMapHeightAt: both return the topmost solid Y at that
         // x/z, but the rain map is updated whenever a block is placed, so the roof of any building
@@ -404,26 +548,51 @@ public class RoomThermalSystem : ModSystem
     {
         Cuboidi c = e.Room.Location;
         int m = outer ? Math.Max(1, config.SourceScanMargin) : 1;
-        double inside = 0, nearby = 0;
+        var scan = default(Scan);
         var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, e.Dimension);
         for (int x = c.MinX - m; x <= c.MaxX + m; x++)
             for (int y = c.MinY - m; y <= c.MaxY + m; y++)
                 for (int z = c.MinZ - m; z <= c.MaxZ + m; z++)
-                    AddSource(pos.Set(x, y, z), c, ref inside, ref nearby);
-        e.SourceWatts = inside;
+                    AddSource(pos.Set(x, y, z), c, ref scan);
+        e.SourceWatts = scan.Inside;
+        e.SmokeWatts = scan.SmokeWatts;
+        e.SmokeSources = scan.SmokeSources;
         // A pass that stopped at the first shell has seen nothing of the rock: keep what the last full one found.
-        if (outer) e.NearbyWatts = nearby;
+        if (outer) e.NearbyWatts = scan.Nearby;
     }
 
-    private void AddSource(BlockPos pos, Cuboidi c, ref double inside, ref double nearby)
+    /// <summary>Running totals of one <see cref="ScanSources"/> pass.</summary>
+    private struct Scan
     {
-        IHeatSource? src = sapi.World.BlockAccessor.GetBlock(pos)?.GetInterface<IHeatSource>(sapi.World, pos);
-        if (src == null) return;
-        double watts = src.GetHeatStrength(sapi.World, pos, pos) * config.WattsPerHeatStrength;
+        public double Inside, Nearby, SmokeWatts;
+        public int SmokeSources;
+    }
+
+    private void AddSource(BlockPos pos, Cuboidi c, ref Scan scan)
+    {
+        Block? block = sapi.World.BlockAccessor.GetBlock(pos);
+        if (block == null || block.Id == 0) return;
         int d = Math.Max(Exposure.Beyond(pos.X, c.MinX, c.MaxX),
                 Math.Max(Exposure.Beyond(pos.Y, c.MinY, c.MaxY), Exposure.Beyond(pos.Z, c.MinZ, c.MaxZ)));
-        if (d == 0) inside += watts; else nearby += watts * Exposure.Reach(d);
+        // Only what burns inside the room smokes into it. BlockFirepit and BlockPitkiln implement
+        // ISmokeEmitter, and both answer false while they are not lit.
+        bool smoking = d == 0 && block.GetInterface<ISmokeEmitter>(sapi.World, pos)?.EmitsSmoke(pos) == true;
+        if (smoking) scan.SmokeSources++;
+
+        IHeatSource? src = block.GetInterface<IHeatSource>(sapi.World, pos);
+        if (src == null) return;
+        double watts = src.GetHeatStrength(sapi.World, pos, pos) * config.WattsPerHeatStrength;
+        if (d > 0) { scan.Nearby += watts * Exposure.Reach(d); return; }
+        scan.Inside += watts;
+        if (smoking) scan.SmokeWatts += watts;
     }
+
+    /// <summary>
+    /// Power a drawing flue takes straight up the stack, W: the share of an open hearth's fire that
+    /// leaves with the combustion gases instead of warming the room. Without a flue nothing is lost
+    /// this way, and the smoke stays in the room instead.
+    /// </summary>
+    private double FlueWatts(RoomEntry e) => e.Geom.FlueColumns > 0 ? config.FlueLossFraction * e.SmokeWatts : 0;
 
     private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Location, e.Dimension) ?? e.OutsideTemperature;
 
@@ -500,7 +669,7 @@ public class RoomThermalSystem : ModSystem
         e.Wind = WindAt(e);
         e.WindTemperature = UpwindTemperature(e);
         UpdateSunFactors(e);
-        e.Gradient = Stratification.Gradient(e.SourceWatts, config.StratificationKPerMPerKW, config.StratificationMaxKPerM);
+        e.Gradient = Stratification.Gradient(e.SourceWatts - FlueWatts(e), config.StratificationKPerMPerKW, config.StratificationMaxKPerM);
 
         // A face at height Y sees T + gradient×(Y + 0.5 − yMid), not the mean T. Keeping the edges on
         // the mean and injecting −Σ G_f × gradient × (Y_f + 0.5 − yMid) into the room node is the
@@ -519,6 +688,27 @@ public class RoomThermalSystem : ModSystem
         e.WindConductance = wind;
         e.StratificationWatts = strat;
         e.SolarWatts = sun;
+    }
+
+    /// <summary>
+    /// The chimney, once the stratification gradient is known. The draft is a conductance toward the
+    /// outside air recomputed from the current temperatures every tick: over one step it is linear,
+    /// which is all the implicit integration needs, and the square root of the temperature difference
+    /// is folded back in on the next one. The air that actually leaves is the ceiling's, not the mean,
+    /// so the difference goes in as an extra power exactly the way the stratification does.
+    /// </summary>
+    private void UpdateDraftAndSmoke(RoomEntry e, double dtSeconds)
+    {
+        Geometry g = e.Geom;
+        double ceiling = LocalTemperature(e, e.Room.Location.MaxY);
+        // The inlet is half a metre above the floor: the cracks the draft pulls through are spread
+        // over the whole envelope, and milestone 6 will put the real openings' mean height here.
+        e.DraftFlow = Chimney.Draft(config.DischargeCoefficient, g.FlueColumns, g.InletArea,
+            g.FlueTopY - (e.Room.Location.MinY + 0.5), ceiling, e.OutsideTemperature);
+        e.DraftConductance = Chimney.Conductance(e.DraftFlow);
+        e.DraftWatts = -e.DraftConductance * (ceiling - e.Temperature);
+        e.Smoke = Chimney.Smoke(e.Smoke, e.SmokeSources * config.SmokePerSourcePerHour,
+            Chimney.AirChanges(e.DraftFlow, g.Volume, BaseAirChanges), dtSeconds / 3600);
     }
 
     private double SolAir(RoomEntry e, in Face f) =>
@@ -632,8 +822,19 @@ public class RoomThermalSystem : ModSystem
         (double geologic, double forest) = Land(e);
         flows = new RoomFlows(e.Temperature, e.OutsideTemperature,
             e.Geom.GroundFaces == 0 ? double.NaN : e.GroundTemp, e.WindTemperature,
-            e.Wind, e.Gradient, yMid, e.StratificationWatts, faces, e.SolarWatts, geologic, forest);
+            e.Wind, e.Gradient, yMid, e.StratificationWatts, faces, e.SolarWatts, geologic, forest,
+            DraftOf(e), e.Smoke, e.SmokeSources);
         return true;
+    }
+
+    /// <summary>null when the room has no chimney block on its ceiling at all.</summary>
+    private static DraftState? DraftOf(RoomEntry e)
+    {
+        Geometry g = e.Geom;
+        if (g.Flues.Count == 0) return null;
+        return new DraftState((int)Math.Round(g.FlueHeight), g.FlueColumns, g.FlueColumns == 0,
+            e.DraftFlow, e.DraftConductance * (e.OutsideTemperature - LocalTemperature(e, e.Room.Location.MaxY)),
+            g.InletArea, g.ChimneyBlocks);
     }
 
     // --- Persistence -------------------------------------------------------------------------
@@ -693,7 +894,7 @@ public class RoomThermalSystem : ModSystem
         if (g <= 0) { e.Temperature = saved.Temperature; return; }
         ScanSources(e, outer: true);
         double teq = (e.Geom.Conductance * e.OutsideTemperature + e.Geom.GroundConductance * e.GroundTemp
-                      + e.SourceWatts + e.NearbyWatts) / g;
+                      + e.SourceWatts - FlueWatts(e) + e.NearbyWatts) / g;
         double dt = Math.Max(0, sapi.World.Calendar.TotalHours - saved.TotalHours) * 3600;
         e.Temperature = ThermalNetwork.Relax(saved.Temperature, teq, dt, Capacity(e.Geom) / g);
     }
@@ -787,7 +988,9 @@ public class RoomThermalSystem : ModSystem
         sb.Append(c, $"Volume {g.Volume} blocks, capacity {Capacity(g) / 1000:0} kJ/K").AppendLine();
         sb.Append(c, $"Sources: {e.SourceWatts + e.NearbyWatts:0} W");
         if (e.NearbyWatts != 0) sb.Append(c, $" (nearby {e.NearbyWatts:0} W)");
+        if (FlueWatts(e) > 0) sb.Append(c, $" (flue takes {FlueWatts(e):0} W)");
         sb.AppendLine();
+        AppendFlue(sb, c, e);
         sb.Append(c, $"Wind: {Horizontal(e.Wind):0.00} from the {ComesFrom(e.Wind)} at {e.WindTemperature:0.0} °C " +
                      $"(+{(calm <= 0 ? 0 : 100 * e.WindConductance / calm):0.#} % losses, " +
                      $"forest shelter {100 * (1 - e.Shelter):0.#} %)").AppendLine();
@@ -803,6 +1006,20 @@ public class RoomThermalSystem : ModSystem
         AppendWalls(sb, c, "Ground walls", g.Faces.Where(f => f.Ground), e.Temperature - e.GroundTemp);
         report = sb.ToString().TrimEnd();
         return true;
+    }
+
+    /// <summary>The chimney and what it is doing to the air, two lines at most.</summary>
+    private void AppendFlue(StringBuilder sb, CultureInfo c, RoomEntry e)
+    {
+        Geometry g = e.Geom;
+        if (g.Flues.Count == 0) sb.Append("Flue: none").AppendLine();
+        else if (g.FlueColumns == 0) sb.Append("Flue: blocked (roof over the stack)").AppendLine();
+        else
+            sb.Append(c, $"Flue: {g.FlueHeight:0.#} m, {g.FlueColumns} column{(g.FlueColumns == 1 ? "" : "s")}, " +
+                         $"draft {e.DraftFlow:0.00} m³/s ({-e.DraftConductance * (LocalTemperature(e, e.Room.Location.MaxY) - e.OutsideTemperature):0} W), " +
+                         $"inlet leakage {g.InletArea:0.00} m²").AppendLine();
+        if (e.Smoke > 0.1 || e.SmokeSources > 0)
+            sb.Append(c, $"Smoke: {Chimney.Level(e.Smoke)} ({e.Smoke:0.00}), {e.SmokeSources} source{(e.SmokeSources == 1 ? "" : "s")}").AppendLine();
     }
 
     private static void AppendWalls(StringBuilder sb, CultureInfo c, string title, IEnumerable<Face> faces, double dT)

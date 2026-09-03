@@ -27,6 +27,11 @@ public partial class ThermalScenarios : AtlasScenarioBase
     // would become an open 29³ volume.
     private const string Pane = "game:glasspane-leaded-aged-ns";
 
+    // chimneycourse.json declares variantgroups courses/type/orientation with a single course state,
+    // so the placeable block is claybrickchimney-four-<type>-<orientation>. It is the one carrying the
+    // Chimney behavior; the legacy claybrickchimney-<type>-<state>-<orientation> carries none.
+    private const string Chimney = "game:claybrickchimney-four-red-ns";
+
     /// <summary>5×5×5 box: solid shell, interior air volume 3×3×3 (27 blocks, 54 faces).</summary>
     private const int Inner = 3;
 
@@ -59,6 +64,9 @@ public partial class ThermalScenarios : AtlasScenarioBase
 
     [GeneratedRegex(@"Sources: -?\d+ W \(nearby (-?\d+) W\)")]
     private static partial Regex NearbyWatts();
+
+    [GeneratedRegex(@"draft (\d+\.\d+) m³/s")]
+    private static partial Regex DraftFlow();
 
     [GeneratedRegex(@"floor (-?\d+(?:\.\d+)?) °C")]
     private static partial Regex FloorTemp();
@@ -730,5 +738,127 @@ public partial class ThermalScenarios : AtlasScenarioBase
             Caller = new Vintagestory.API.Common.Caller { Player = player.Player, CallerPrivileges = ["*"] }
         }, result => message = result.StatusMessage ?? "");
         return message;
+    }
+
+    // --- Milestone 4: chimney -----------------------------------------------------------------
+
+    /// <summary>
+    /// Stacks <paramref name="blocks"/> chimney blocks straight up from the roof over
+    /// <paramref name="firepit"/>. +3 is the roof itself: the firepit sits on the interior floor
+    /// layer (Room's y=0), the roof shell is 3 blocks above that (Room's y=3, see <see cref="Build"/>),
+    /// and the first chimney block replaces it.
+    /// </summary>
+    private void BuildChimney(BlockPos firepit, int blocks)
+    {
+        for (int i = 0; i < blocks; i++)
+            World.SetBlock(Chimney, firepit.Offset(0, 3 + i, 0));
+    }
+
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Chimney_is_detected_with_its_height()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusChimney4", 860, Stone);
+        try
+        {
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            BuildChimney(firepit, 4);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+
+            await WaitForRoomReport(inside, r => r.Contains("Flue: 4 m, 1 column"));
+            await World.Ticks(300); // ≈ 10 real seconds, ≈ 1.7 game hours at ×10: time for the draft to settle the haze
+            string report = await ReportAt(inside);
+
+            Assert.Contains("Flue: 4 m, 1 column", report);
+            Assert.Contains("(flue takes", report);
+            Assert.DoesNotContain("Smoke: heavy", report);
+        }
+        finally { await Leave(player); }
+    }
+
+    /// <summary>
+    /// Compares draft/√dT rather than the raw flow: Q ∝ √(dH·dT), so dividing the temperature
+    /// difference back out leaves only what the flue's own height is worth, robust to the two
+    /// rooms not settling on quite the same temperature.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Taller_chimney_draws_more()
+    {
+        (ITestPlayer shortPlayer, BlockPos shortRoom) = await RoomAndPlayer("CaminusChimShort", 940, Stone);
+        (ITestPlayer tallPlayer, BlockPos tallRoom) = await RoomAndPlayer("CaminusChimTall", 1020, Stone);
+        try
+        {
+            SetWindPattern("still"); // this comparison reads instantaneous draft: keep the wind out of it
+            BlockPos shortFire = shortRoom.Offset(0, -1, 0), tallFire = tallRoom.Offset(0, -1, 0);
+            LightFirepit(shortFire);
+            LightFirepit(tallFire);
+            await World.Until(() => Firepit(shortFire)?.IsBurning == true && Firepit(tallFire)?.IsBurning == true);
+            BuildChimney(shortFire, 4);
+            BuildChimney(tallFire, 8);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+
+            await WaitForRoomReport(shortRoom, r => r.Contains("Flue: 4 m, 1 column"));
+            await WaitForRoomReport(tallRoom, r => r.Contains("Flue: 8 m, 1 column"));
+            await World.Ticks(300);
+
+            string shortReport = await ReportAt(shortRoom), tallReport = await ReportAt(tallRoom);
+            double shortDt = Read(CeilingTemp(), shortReport) - Read(OutsideTemp(), shortReport);
+            double tallDt = Read(CeilingTemp(), tallReport) - Read(OutsideTemp(), tallReport);
+            Assert.True(shortDt > 0.5 && tallDt > 0.5,
+                $"not enough of a draft signal yet\nshort:\n{shortReport}\ntall:\n{tallReport}");
+
+            double shortNorm = Read(DraftFlow(), shortReport) / Math.Sqrt(shortDt);
+            double tallNorm = Read(DraftFlow(), tallReport) / Math.Sqrt(tallDt);
+            Assert.True(tallNorm > shortNorm,
+                $"8-block flue: {tallNorm:0.0000} vs 4-block: {shortNorm:0.0000}\nshort:\n{shortReport}\ntall:\n{tallReport}");
+        }
+        finally
+        {
+            await Leave(shortPlayer);
+            await Leave(tallPlayer);
+        }
+    }
+
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Hearth_without_chimney_fills_the_room_with_smoke()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusSmoky", 1100, Stone);
+        try
+        {
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+
+            await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
+            // No flue: air changes stay at the envelope's own leakage alone, so the haze needs
+            // longer than the other scenarios to reach its (clamped) equilibrium.
+            await World.Ticks(600); // ≈ 20 real seconds, ≈ 3.3 game hours at ×10
+            string report = await ReportAt(inside);
+
+            Assert.Contains("Flue: none", report);
+            Assert.Contains("Smoke: heavy", report);
+        }
+        finally { await Leave(player); }
+    }
+
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Blocked_chimney_counts_as_none()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusChimBlock", 1180, Stone);
+        try
+        {
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            BuildChimney(firepit, 4);
+            World.SetBlock(Stone, firepit.Offset(0, 7, 0)); // caps the stack: no sky above it
+
+            string report = await WaitForRoomReport(inside, r => r.Contains("Flue: blocked"));
+            Assert.Contains("Flue: blocked (roof over the stack)", report);
+            Assert.DoesNotContain("flue takes", report);
+        }
+        finally { await Leave(player); }
     }
 }

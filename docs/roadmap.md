@@ -19,7 +19,7 @@ testable. Target: 1.22.7, precompiled mod (Harmony isn't accessible to source mo
 
 ## Status and reordering (2026-09-03)
 
-Milestones 0, 1, 2, 2b, 5 and 3 are on `main` with Atlas scenarios (20 engine tests, 16 scenarios).
+Milestones 0, 1, 2, 2b, 5, 3 and 4 are on `main` with Atlas scenarios (29 engine tests, 20 scenarios).
 After the first in-game test the order changed:
 
 - **Milestone 2b, done**: wind (speed, direction, windward faces and openings leak more),
@@ -34,7 +34,27 @@ After the first in-game test the order changed:
   vanilla update is ported line by line; the flat +1 °C per hour every enclosed room used to grant
   is gone, and the room node's air at the player's eye height feeds the same comfort term vanilla
   applies outdoors. Details and what was verified: `api-1.22.7-verification.md` section 13.
-- Next: milestone 4 (chimney draft), then milestone 6.
+- **Milestone 4, done (2026-09-03)**: a flue is a vertical run of blocks carrying the `Chimney`
+  behavior starting on a ceiling face of the room; valid if its top sees the sky, blocked otherwise.
+  Stack draft `Q = Cd·A_eff·√(2·g·ΔH·ΔT/T_abs)`, with the envelope's own leakage as the inlet in
+  series with the flue's own section; the draft is added as an extra conductance from the room to
+  the outside node, and the share of a smoking source's power set by `flueLossFraction` leaves with
+  it instead of heating the room. A per-room `Smoke` value (0..1) rises with lit smoke sources
+  (`BlockFirepit`, `BlockPitkiln`) and decays with the air changes the draft (or the bare envelope)
+  provides; the `/caminus temp` report gained `Flue:` and `Smoke:` lines and the `Sources:` line
+  notes the flue's share, the overlay highlights the stack and drifts particles up it. No room-to-room
+  edge was needed for a stacked cabin: two rooms connected by open air are already one room to the
+  vanilla `RoomRegistry`, so the "vertical links between stacked rooms" item from the original brief
+  had nothing to attach to yet. What the brief called "a low opening vs. none" as the draft's inlet
+  is still just the envelope's flat per-face leakage: a real opening's position and height only
+  matter once milestone 6's own room detection can keep a hole in a wall without losing the room, so
+  that refinement moves there. Tested: `Chimney_is_detected_with_its_height` (a 4-block stack reads
+  as one flue, correct height, no heavy smoke once it draws), `Taller_chimney_draws_more` (8 blocks
+  draft more than 4, compared as draft/√ΔT to stay robust to the two rooms not settling on quite the
+  same temperature), `Hearth_without_chimney_fills_the_room_with_smoke`, `Blocked_chimney_counts_as_none`
+  (a stone cap over the stack reads as blocked, not as no flue at all). Engine coverage in
+  `Caminus.Core.Tests.ChimneyTests`. Details: `api-1.22.7-verification.md` section 14.
+- Next: milestone 6.
 
 ## Milestone 0: skeleton (1 to 2 days)
 
@@ -95,20 +115,26 @@ freezing; light it and warm back up.
 Compatibility still to check with Immersive Body Temperature and RealisticTemperatures: they target
 the same behavior entry, and whichever patch runs last wins the `code` field.
 
-## Milestone 4: the chimney (2 weeks, the heart of the gameplay)
+## Milestone 4: the chimney (done, 2026-09-03)
 
-- Duct detection: a column of `claybrickchimney` (or hollow blocks) above the firepit, height and
-  cross-section. A firepit without a duct smokes into the room (penalty); with a duct, some of the
-  power goes into the draft.
-- Draft: `Q = Cd·A·√(2·g·ΔH·ΔT/T)` between the room and the outdoors via the duct; the air drawn in
-  enters through low openings (infiltration flow added to the edges toward outdoors or the room
-  below). Same nonlinear term for vertical links between stacked rooms (an open stairwell).
-  Linearized at each step around the current state, implicit integration still holds.
-- Analytic stratification `T(y) = T_avg + gradient·(y − y_floor)`: what the thermometer reads
-  depends on the player's height.
+- Duct detection: a column of blocks carrying the `Chimney` behavior above the firepit (any block
+  with that behavior, not just `claybrickchimney` by name), grouped into one flue per connected
+  horizontal footprint on the ceiling; valid if its top sees the sky, blocked otherwise. A firepit
+  without a working duct smokes into the room; with one, `flueLossFraction` of its power leaves
+  with the draft instead of heating the room.
+- Draft: `Q = Cd·A_eff·√(2·g·ΔH·ΔT/T_abs)` between the room and the outdoors via the duct, where
+  `A_eff` is the flue's own section in series with the envelope's leakage (the inlet); added as an
+  extra conductance from the room node to the outside node, recomputed from the current
+  temperatures every tick.
+- Per-room `Smoke` (0..1): rises with lit smoke sources, decays with the air changes the draft (or
+  the bare envelope) provides, integrated in closed form so a strongly drawing flue does not
+  oscillate at a 1 s step.
+- Analytic stratification `T(y) = T_avg + gradient·(y − y_floor)` (done earlier, milestone 2b): what
+  the thermometer reads depends on the player's height, and it is what feeds the flue the ceiling's
+  own temperature rather than the room's mean.
 
-Testable: unit test of the draft (flow increasing with height, zero at ΔT = 0). In-game: the same
-firepit, a 3- vs. 8-block duct; a low opening vs. none; an attic above that warms up.
+Vertical links between stacked rooms and low openings as draft inlets were in the original brief;
+neither turned out to be needed yet. See the status section above for why, and for what was tested.
 
 ## Milestone 5: reading your building (1 to 2 weeks)
 
