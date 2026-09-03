@@ -28,6 +28,14 @@ and the floor/eyes/ceiling spread with the net power.
 Highlights and particles are drawn by the server, so a client without Caminus installed sees them
 too. The hotkey and the text box need the mod on the client.
 
+## Test houses
+
+`templates/` holds seven WorldEdit schematics, one per feature: a stone cabin with a chimney, the
+same in wood without one, a cabin with draft holes, a glass house, a cellar, a cellar over a lava
+pocket, and a 20×20 hall. Copy them into the `WorldEdit` folder of a game installation, then in
+creative mode mark a spot with `/we s` and `/we e` and type `/we imp cabin-stone`. Full import recipe
+and what each house is meant to show: `templates/README.md`.
+
 ## Build
 
 ```bash
