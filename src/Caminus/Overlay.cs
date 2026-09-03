@@ -235,13 +235,14 @@ public class OverlayHud : HudElement
         // which is what HudElementCoordinates waits for with OnOwnPlayerDataReceived.
         if (SingleComposer == null)
         {
-            ElementBounds text3Lines = ElementBounds.Fixed(0, 0, 420, 66);
+            // Wide enough for the longest line in medium text, tall enough for a wrapped one.
+            ElementBounds text3Lines = ElementBounds.Fixed(0, 0, 760, 110);
             SingleComposer = capi.Gui
                 .CreateCompo("caminusoverlay", ElementStdBounds.AutosizedMainDialog
                     .WithAlignment(EnumDialogArea.LeftTop)
                     .WithFixedAlignmentOffset(GuiStyle.DialogToScreenPadding, GuiStyle.DialogToScreenPadding))
                 .AddGameOverlay(text3Lines.ForkBoundingParent(5, 5, 5, 5))
-                .AddDynamicText("", CairoFont.WhiteSmallishText(), text3Lines, "text")
+                .AddDynamicText("", CairoFont.WhiteMediumText(), text3Lines, "text")
                 .Compose();
         }
         SingleComposer.GetDynamicText("text").SetNewText(text);
