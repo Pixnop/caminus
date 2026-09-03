@@ -954,4 +954,91 @@ public partial class ThermalScenarios : AtlasScenarioBase
             await Leave(openPlayer);
         }
     }
+
+    // --- Milestone 5: the overlay as the client receives it -------------------------------------
+
+    /// <summary>
+    /// The other half of <see cref="Overlay_describes_the_room"/>: not what the server builds, but what
+    /// leaves it. Atlas 0.12 drains the test player's own connection, so the highlight packet, the
+    /// particles and the OverlayPacket are read where a real client reads them, and
+    /// <c>OverlayServer.Highlights</c> is checked against the cubes that actually travelled.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Overlay_reaches_the_player()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusOvNet", 1460, Stone);
+        try
+        {
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
+            // Same warm-up as Overlay_describes_the_room: every face has to be losing heat before the
+            // colours below mean anything (red is "heat leaving", blue would be heat coming in).
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
+
+            player.Client.Clear();
+            // The command's answer never becomes a chat line here: a real client's message goes through
+            // the server's chat handler, which supplies the result callback, and Atlas has no "player
+            // types this" entry point, so the answer only exists in the callback we pass ourselves.
+            Assert.Contains("Thermal overlay on.", PlayerReport(player, "/caminus overlay"));
+
+            // The overlay rides the mod's own 1 s tick, i.e. 30 server ticks.
+            await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count > 0, 300);
+
+            IReadOnlyList<HighlightedBlock> cubes = player.Client.Highlights(OverlayServer.HighlightSlot);
+            RoomThermalSystem thermal = World.Api.ModLoader.GetModSystem<RoomThermalSystem>();
+            Assert.True(thermal.TryGetFaceFlows(inside, out RoomFlows? flows), "the room stopped being tracked");
+            (List<BlockPos> blocks, _) = OverlayServer.Highlights(flows!);
+            // A wall block can carry two faces (an inner corner), and the highlight is one cube per
+            // block: on this box the 54 faces sit on 54 distinct blocks (a 3x3 plate per wall, no
+            // block shared between two walls), so the count survives the dedupe.
+            Assert.Equal(54, blocks.Count);
+            Assert.Equal(blocks.ToHashSet(), cubes.Select(c => c.Pos).ToHashSet());
+            // Stone wall, no ground, no opening, heat leaving: (255, 50, 40) shaded by alpha.
+            Assert.All(cubes, c => Assert.Equal(255, c.Rgba.R));
+            Assert.All(cubes, c => Assert.True(c.Rgba.R > c.Rgba.G && c.Rgba.R > c.Rgba.B,
+                $"cube at {c.Pos} is not red: {c.Rgba}"));
+
+            IReadOnlyList<OverlayPacket> texts = player.Client.Packets<OverlayPacket>("caminus");
+            Assert.NotEmpty(texts);
+            Assert.StartsWith("Room ", texts[^1].Text);
+            Assert.Contains("outside", texts[^1].Text);
+
+            // Particles only reach a player whose chunk at the spawn position is streamed, and the
+            // overlay spawns them on every tick, so this is a wait rather than a single read.
+            await World.Until(() => player.Client.Particles().Count > 0, 300);
+            IReadOnlyList<SpawnedParticles> puffs = player.Client.Particles();
+            Assert.Contains(puffs, p => p.Rgba.R == 255 && p.Rgba.R > p.Rgba.B);
+            var center = new Vec3d(inside.X + 0.5, inside.Y + 0.5, inside.Z + 0.5);
+            Assert.All(puffs, p => Assert.True(p.Position.DistanceTo(center) < 4,
+                $"a puff spawned at {p.Position}, {p.Position.DistanceTo(center):0.0} blocks from the room"));
+
+            // Two more mod ticks with nobody reading, so the timed read below pays for a real drain
+            // (every read decodes whatever arrived since the previous one, so a read right after a
+            // World.Until poll would be measuring nothing at all).
+            await World.Ticks(60);
+            Stopwatch clock = Stopwatch.StartNew();
+            int seen = player.Client.Highlights(OverlayServer.HighlightSlot).Count;
+            double highlightMs = clock.Elapsed.TotalMilliseconds;
+            clock.Restart();
+            int packets = player.Client.Packets<OverlayPacket>("caminus").Count;
+            Console.WriteLine($"[Caminus] client observations: Highlights({seen} cubes) {highlightMs:0.00} ms, " +
+                              $"Packets<OverlayPacket>({packets}) {clock.Elapsed.TotalMilliseconds:0.00} ms, " +
+                              $"{puffs.Count} particle spawns, {player.Client.ChatLines().Count} chat lines");
+
+            // Off: the mod clears the slot and sends an empty text, and the empty highlight packet is
+            // exactly how a slot is cleared client side.
+            Assert.Contains("Thermal overlay off.", PlayerReport(player, "/caminus overlay"));
+            await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count == 0, 300);
+            Assert.Equal("", player.Client.Packets<OverlayPacket>("caminus")[^1].Text);
+
+            player.Client.Clear();
+            Assert.Empty(player.Client.Highlights(OverlayServer.HighlightSlot));
+            Assert.Empty(player.Client.Packets<OverlayPacket>("caminus"));
+            Assert.Empty(player.Client.Particles());
+        }
+        finally { await Leave(player); }
+    }
 }
