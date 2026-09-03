@@ -27,7 +27,8 @@ public class OverlayPacket
 public class OverlayServer : ModSystem
 {
     /// <summary>Highlight slot. Vanilla holds 1, 2, 26, 27, 50, 941, 942 and 1292.</summary>
-    private const int Slot = 7;
+    /// <summary>Block highlight slot the overlay draws in. Public so test harnesses can read it back.</summary>
+    public const int HighlightSlot = 7;
     /// <summary>How many faces get flow particles, loudest first.</summary>
     private const int ParticleFaces = 16;
     /// <summary>Alpha of the quietest face, so that a wall doing nothing is still visible.</summary>
@@ -67,7 +68,7 @@ public class OverlayServer : ModSystem
 
     private void Clear(IServerPlayer player)
     {
-        sapi.World.HighlightBlocks(player, Slot, []);
+        sapi.World.HighlightBlocks(player, HighlightSlot, []);
         channel.SendPacket(new OverlayPacket(), player);
     }
 
@@ -81,7 +82,7 @@ public class OverlayServer : ModSystem
             if (!thermal.TryGetFaceFlows(pos, out RoomFlows? flows)) { Clear(player); continue; }
 
             (List<BlockPos> blocks, List<int> colors) = Highlights(flows);
-            sapi.World.HighlightBlocks(player, Slot, blocks, colors);
+            sapi.World.HighlightBlocks(player, HighlightSlot, blocks, colors);
             SpawnFlowParticles(flows);
             SpawnFlueParticles(flows);
             double? body = player.Entity.GetBehavior<EntityBehaviorCaminusBodyTemperature>()?.CurBodyTemperature;
@@ -252,6 +253,15 @@ public class OverlayClient : ModSystem
 /// <summary>Three lines in the top left corner, hidden while the server sends nothing.</summary>
 public class OverlayHud : HudElement
 {
+    /// <summary>Stable identifier of this dialog for test harnesses. The dynamic text component is named "text".</summary>
+    public const string DialogKey = "caminus:overlayhud";
+
+    /// <summary>
+    /// Deliberately null: the K hotkey is handled by OverlayClient, which asks the server to toggle
+    /// the overlay; letting the dialog toggle itself on the same key would open an empty HUD.
+    /// </summary>
+    public override string ToggleKeyCombinationCode => null!;
+
     public OverlayHud(ICoreClientAPI capi) : base(capi) { }
 
     public void Set(string text)
