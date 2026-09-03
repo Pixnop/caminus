@@ -409,18 +409,20 @@ public class RoomThermalSystem : ModSystem
         for (int x = c.MinX - m; x <= c.MaxX + m; x++)
             for (int y = c.MinY - m; y <= c.MaxY + m; y++)
                 for (int z = c.MinZ - m; z <= c.MaxZ + m; z++)
-                {
-                    pos.Set(x, y, z);
-                    IHeatSource? src = sapi.World.BlockAccessor.GetBlock(pos)?.GetInterface<IHeatSource>(sapi.World, pos);
-                    if (src == null) continue;
-                    double watts = src.GetHeatStrength(sapi.World, pos, pos) * config.WattsPerHeatStrength;
-                    int d = Math.Max(Exposure.Beyond(x, c.MinX, c.MaxX),
-                            Math.Max(Exposure.Beyond(y, c.MinY, c.MaxY), Exposure.Beyond(z, c.MinZ, c.MaxZ)));
-                    if (d == 0) inside += watts; else nearby += watts * Exposure.Reach(d);
-                }
+                    AddSource(pos.Set(x, y, z), c, ref inside, ref nearby);
         e.SourceWatts = inside;
         // A pass that stopped at the first shell has seen nothing of the rock: keep what the last full one found.
         if (outer) e.NearbyWatts = nearby;
+    }
+
+    private void AddSource(BlockPos pos, Cuboidi c, ref double inside, ref double nearby)
+    {
+        IHeatSource? src = sapi.World.BlockAccessor.GetBlock(pos)?.GetInterface<IHeatSource>(sapi.World, pos);
+        if (src == null) return;
+        double watts = src.GetHeatStrength(sapi.World, pos, pos) * config.WattsPerHeatStrength;
+        int d = Math.Max(Exposure.Beyond(pos.X, c.MinX, c.MaxX),
+                Math.Max(Exposure.Beyond(pos.Y, c.MinY, c.MaxY), Exposure.Beyond(pos.Z, c.MinZ, c.MaxZ)));
+        if (d == 0) inside += watts; else nearby += watts * Exposure.Reach(d);
     }
 
     private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Location, e.Dimension) ?? e.OutsideTemperature;
@@ -627,7 +629,7 @@ public class RoomThermalSystem : ModSystem
             faces.Add(new FaceFlow(f, f.UA + extra,
                 f.UA * (local - node - sol) + extra * (local - e.WindTemperature)));
         }
-        (double geologic, double forest) = Land(e);
+        double geologic = Land(e).Geologic;
         flows = new RoomFlows(e.Temperature, e.OutsideTemperature,
             e.Geom.GroundFaces == 0 ? double.NaN : e.GroundTemp, e.WindTemperature,
             e.Wind, e.Gradient, yMid, e.StratificationWatts, faces, e.SolarWatts, geologic, forest);
@@ -774,7 +776,7 @@ public class RoomThermalSystem : ModSystem
         // separator that changes with the server locale would make the format unstable.
         CultureInfo c = CultureInfo.InvariantCulture;
         var sb = new StringBuilder();
-        (double geologic, double forest) = Land(e);
+        double geologic = Land(e).Geologic;
         sb.Append(c, $"Room: {e.Temperature:0.0} °C, outside {e.OutsideTemperature:0.0} °C").AppendLine();
         if (g.GroundFaces > 0)
         {

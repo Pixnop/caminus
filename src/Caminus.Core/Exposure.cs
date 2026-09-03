@@ -28,11 +28,12 @@ public static class Exposure
     /// never square to a sun that is overhead) and the opposite wall nothing. A floor never sees the
     /// sun, and nor does anything once the sun has set.
     /// </summary>
-    public static double Incidence(double sunX, double sunY, double sunZ, int nX, int nY, int nZ) =>
-        sunY <= 0 ? 0
-        : nY > 0 ? sunY
-        : nY < 0 ? 0
-        : WallShare * Math.Max(0, sunX * nX + sunZ * nZ);
+    public static double Incidence(double sunX, double sunY, double sunZ, int nX, int nY, int nZ)
+    {
+        if (sunY <= 0 || nY < 0) return 0;
+        if (nY > 0) return sunY;
+        return WallShare * Math.Max(0, sunX * nX + sunZ * nZ);
+    }
 
     /// <summary>
     /// Distance from <paramref name="v"/> to the closed interval, minus the first block outside it:
