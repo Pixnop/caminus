@@ -19,8 +19,8 @@ testable. Target: 1.22.7, precompiled mod (Harmony isn't accessible to source mo
 
 ## Status and reordering (2026-09-03)
 
-Milestones 0, 1, 2, 2b, 5, 3 and 4 are on `main` with Atlas scenarios (29 engine tests, 20 scenarios).
-After the first in-game test the order changed:
+Milestones 0, 1, 2, 2b, 5, 3, 4 and 6 are on `main` with Atlas scenarios (29 engine tests, 22 thermal
+scenarios). After the first in-game test the order changed:
 
 - **Milestone 2b, done**: wind (speed, direction, windward faces and openings leak more),
   analytic vertical stratification (the ceiling is warmer than the floor and loses more), and
@@ -54,7 +54,26 @@ After the first in-game test the order changed:
   same temperature), `Hearth_without_chimney_fills_the_room_with_smoke`, `Blocked_chimney_counts_as_none`
   (a stone cap over the stack reads as blocked, not as no flue at all). Engine coverage in
   `Caminus.Core.Tests.ChimneyTests`. Details: `api-1.22.7-verification.md` section 14.
-- Next: milestone 6.
+- **Milestone 6, done (2026-09-03)**: `RoomScanner` is Caminus's own flood fill and the thermal model
+  no longer asks the vanilla registry anything. Same wall criterion as vanilla
+  (`Block.GetRetention(pos, facing, Heat) == 0` crosses), so doors, panes and chiseled blocks behave
+  exactly as they did, but two rules change: the fill has no 14-block limit, only a budget
+  (`maxRoomBlocks` 4096, `maxRoomExtent` 48 per axis, past which the volume is called outdoors), and
+  air open to the sky is not walked into, it is recorded as an **opening**. So a 20x4x20 hall is a
+  room, and a room with a window stays a room with the hole priced as one square metre of
+  `openingConductance`, one square metre of draft inlet, wind leaking through it, and
+  `openingAirChangesPerFace` of air renewal against the smoke. The flue's inlet height is now the mean
+  height of the openings rather than the floor, which is the "a low opening vs. none" refinement
+  milestone 4 pushed here. Invalidation follows vanilla's: `ChunkDirty` queues the chunk, the tick
+  marks the rooms it touches stale, and a stale room is rescanned the next time someone stands in it
+  or one of its containers asks, at most `maxScansPerTick` (2) fills a tick server-wide. One fill of
+  the 1600-block hall measures 0.6 to 1.4 ms. The vanilla `RoomRegistry` is untouched and still decides
+  greenhouses, cellars and the game's own spoilage. Tested:
+  `Hall_wider_than_the_vanilla_limit_is_a_room` (the vanilla registry gives up on it, Caminus reports
+  1600 blocks and 1120 stone faces) and `Window_is_an_opening_not_an_exit` (one wall block removed at
+  floor level reads as `Openings: 1 faces`, the room survives, and the same 4-block chimney draws
+  harder than in the sealed twin). Details: `api-1.22.7-verification.md` section 15.
+- Next: compatibility passes against the ModDB neighbours, and balancing from playtests.
 
 ## Milestone 0: skeleton (1 to 2 days)
 
@@ -145,13 +164,17 @@ neither turned out to be needed yet. See the status section above for why, and f
 
 Testable: measured bandwidth with the overlay active on a 30-room base; reference screenshot.
 
-## Milestone 6: large volumes and robustness (2 weeks)
+## Milestone 6: large volumes and robustness (flood fill done, 2026-09-03)
 
-- Homemade flood-fill for rooms beyond 14 blocks (block budget, run on a worker thread with
-  `ICachingBlockAccessor`, merge into "outdoors" when the limit is hit). The vanilla `RoomRegistry`
-  stays in use for the game's greenhouses and cellars.
-- Compatibility tested against ModDB neighbors (list in the survey), Real Smoke first.
-- Balancing: U-value table, power levels, thresholds, from playtest feedback.
+- Homemade flood fill for rooms beyond 14 blocks: done, `src/Caminus/RoomScanner.cs`. Block and
+  extent budget, `ICachingBlockAccessor`, "outdoors" when the budget is hit. It runs on the server
+  main thread rather than a worker one, which the brief left open: the fill is cheap enough
+  (0.6 to 1.4 ms for 1600 blocks) that a per-tick budget is a simpler answer than a thread and a lock.
+  The vanilla `RoomRegistry` stays in use for the game's greenhouses and cellars.
+- Openings: a hole in a wall keeps the room instead of dissolving it, and feeds the conductance, the
+  wind, the draft inlet and its height, and the air changes that clear smoke. See the status section.
+- Compatibility tested against ModDB neighbors (list in the survey), Real Smoke first: still to do.
+- Balancing: U-value table, power levels, thresholds, from playtest feedback: still to do.
 
 ## Reserve (v2)
 

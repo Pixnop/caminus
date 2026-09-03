@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
@@ -50,6 +51,14 @@ public class ThermalConfig
     public double FlueLossFraction { get; set; } = 0.4;
     /// <summary>Haze one smoking source adds per hour, in a room whose air is never renewed.</summary>
     public double SmokePerSourcePerHour { get; set; } = 2.0;
+    /// <summary>Air changes per hour one square metre of opening brings in on its own.</summary>
+    public double OpeningAirChangesPerFace { get; set; } = 2.0;
+    /// <summary>Air blocks a room may hold before Caminus calls it an open volume and gives up.</summary>
+    public int MaxRoomBlocks { get; set; } = 4096;
+    /// <summary>Same, per axis: a hall longer than this is outdoors as far as the model is concerned.</summary>
+    public int MaxRoomExtent { get; set; } = 48;
+    /// <summary>Flood fills the server may run in one tick, all rooms together.</summary>
+    public int MaxScansPerTick { get; set; } = 2;
     /// <summary>Whether heavy smoke hurts. Off by default: the server owner decides after playing.</summary>
     public bool SmokeDamage { get; set; }
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
@@ -89,8 +98,8 @@ public sealed record RoomFlows(
     DraftState? Draft, double Smoke, int SmokeSources);
 
 /// <summary>
-/// Thermal simulation of the rooms players are in. Server side only: RoomRegistry
-/// is not thread-safe, everything runs on the main thread.
+/// Thermal simulation of the rooms players are in. Server side only, and the flood fill
+/// (<see cref="RoomScanner"/>) is not thread-safe, so everything runs on the main thread.
 /// Each room owns its own <see cref="ThermalNetwork"/> of at most four nodes, so a tick costs
 /// O(1) per room and a base with fifty of them is fifty tiny solves, not one 200x200 matrix.
 /// </summary>
@@ -124,10 +133,16 @@ public class RoomThermalSystem : ModSystem
         public double GroundConductance;
         /// <summary>
         /// Area the draft can pull air in through, m²: cracks over the whole envelope, plus any real
-        /// opening at one square metre a face. An enclosed room has no opening, so today this is the
-        /// leakage alone; milestone 6's flood fill is what lets a room keep a hole and stay a room.
+        /// opening at one square metre a face.
         /// </summary>
         public double InletArea;
+        /// <summary>Faces open to the outside air: a doorway, a window, a hole.</summary>
+        public int Openings;
+        /// <summary>
+        /// Height the draft pulls its air in at: the mean height of the openings, or the floor when
+        /// the envelope has none and the air comes in through the cracks spread all over it.
+        /// </summary>
+        public double InletY;
         /// <summary>Chimney blocks resting on the ceiling: the bottom of each column, before grouping.</summary>
         public readonly List<BlockPos> ChimneyStarts = [];
         /// <summary>One entry per chimney stack on the ceiling, blocked ones included.</summary>
@@ -148,8 +163,10 @@ public class RoomThermalSystem : ModSystem
 
     private sealed class RoomEntry
     {
-        public Room Room = null!;
+        public RoomVolume Room = null!;
         public Geometry Geom = null!;
+        /// <summary>A block moved in or next to the room: the geometry is rescanned when it is next needed.</summary>
+        public bool Stale;
         public double Temperature;
         public double OutsideTemperature;
         public double GroundTemp;
@@ -213,11 +230,15 @@ public class RoomThermalSystem : ModSystem
     private sealed record Saved(double Temperature, double TotalHours);
 
     private ICoreServerAPI sapi = null!;
-    private RoomRegistry rooms = null!;
+    private RoomScanner scanner = null!;
     private ThermalConfig config = null!;
     private readonly Dictionary<string, RoomEntry> entries = [];
     /// <summary>Chunks where a container asked for a room and there was none, with the game hour it expires.</summary>
     private readonly Dictionary<(int X, int Y, int Z), double> noRoom = [];
+    /// <summary>Chunks that changed since the last tick, drained at the top of it (see <see cref="OnChunkDirty"/>).</summary>
+    private readonly ConcurrentQueue<Vec3i> dirtyChunks = new();
+    /// <summary>Flood fills already spent this tick, against <c>maxScansPerTick</c>.</summary>
+    private int scans;
     private Harmony? harmony;
 
     public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Server;
@@ -234,6 +255,7 @@ public class RoomThermalSystem : ModSystem
     {
         harmony?.UnpatchAll("caminus");
         harmony = null;
+        scanner?.Dispose();
     }
 
     public override void StartServerSide(ICoreServerAPI api)
@@ -242,8 +264,11 @@ public class RoomThermalSystem : ModSystem
         config = api.Assets.Get("caminus:config/thermal.json").ToObject<ThermalConfig>();
         api.Logger.Notification("[Caminus] config: tick {0} ms, {1} W per heat unit, {2} wall materials",
             config.TickMs, config.WattsPerHeatStrength, config.WallU.Count);
-        rooms = api.ModLoader.GetModSystem<RoomRegistry>();
+        // Caminus does its own room detection (milestone 6). The vanilla RoomRegistry is left
+        // strictly alone: it still answers the game's own questions, greenhouses and cellars first.
+        scanner = new RoomScanner(api, config.MaxRoomBlocks, config.MaxRoomExtent);
         api.Event.RegisterGameTickListener(OnTick, ex => api.Logger.Error("[Caminus] thermal tick: {0}", ex), config.TickMs);
+        api.Event.ChunkDirty += OnChunkDirty;
         // ChunkColumnUnloaded fires BEFORE the unload loop (ServerSystemUnloadChunks.cs:287), so the
         // chunk is still writable. GameWorldSave covers the autosave and the save-on-shutdown
         // (ServerSystemLoadAndSaveGame.cs:204), which is fired before the chunks are written out.
@@ -254,6 +279,8 @@ public class RoomThermalSystem : ModSystem
     private void OnTick(float dtRealSeconds)
     {
         if (dtRealSeconds <= 0) return;
+        scans = 0;
+        MarkDirtyRoomsStale();
         TrackPlayerRooms();
         // A room is kept as long as its chunk column is loaded, player or not: a cellar has to keep
         // cooling while nobody watches, and OnChunkColumnUnloaded is what ends its life.
@@ -312,10 +339,7 @@ public class RoomThermalSystem : ModSystem
         foreach (IPlayer player in sapi.World.AllOnlinePlayers)
         {
             if (player is not IServerPlayer { ConnectionState: EnumClientState.Playing } sp || sp.Entity == null) continue;
-            BlockPos pos = EyeBlockPos(sp.Entity);
-            Room room = rooms.GetRoomForPosition(pos);
-            if (!Enclosed(room)) continue;
-            RoomEntry? e = Track(room, pos.dimension);
+            RoomEntry? e = RoomAt(EyeBlockPos(sp.Entity));
             if (e == null) continue;
             e.HasPlayer = true;
             if (config.SmokeDamage && e.Smoke >= HeavySmoke && e.Ticks % SmokeDamageTicks == 0)
@@ -324,36 +348,92 @@ public class RoomThermalSystem : ModSystem
         }
     }
 
-    // ponytail: an open volume (a doorway to the outside, a hall wider than the vanilla 14-block
-    // limit) is treated as outside; milestone 6 brings the homemade flood fill.
-    private static bool Enclosed([NotNullWhen(true)] Room? room) =>
-        room?.Location != null && room.PosInRoom != null && room.ExitCount == 0;
-
-    private RoomEntry? Track(Room room, int dim)
+    /// <summary>
+    /// The room holding that position, flood filling for one when we have none or when a block moved
+    /// in the one we have. At most <c>maxScansPerTick</c> fills run per tick, all rooms together: a
+    /// room whose turn has not come answers with the geometry it had one tick longer rather than
+    /// making the tick spike.
+    /// </summary>
+    // ponytail: a stale room nobody stands in and no container asks about keeps simulating on its old
+    // geometry until someone walks in or its chunk unloads. Rescan the stale ones in the tick loop,
+    // budget permitting, if that ever shows up in play.
+    private RoomEntry? RoomAt(BlockPos pos)
     {
-        string key = Key(room.Location, dim);
-        if (entries.TryGetValue(key, out RoomEntry? e))
-        {
-            // Same bbox but a different instance: the registry was invalidated by a ChunkDirty, so a
-            // block moved. The geometry is rebuilt, the temperature is kept.
-            if (ReferenceEquals(e.Room, room)) return e;
-            e.Room = room;
-            e.Geom = Measure(room, dim);
-            Build(e);
-            return e;
-        }
+        RoomEntry? held = Find(pos);
+        if (held is { Stale: false }) return held;
+        // Open to the sky is never a room, and answering that costs one heightmap lookup: it must not
+        // eat a scan slot, or every player standing outdoors would starve the real rooms of theirs.
+        if (RoomScanner.SeesSky(sapi.World.BlockAccessor, pos)) { Drop(held); return null; }
+        if (scans >= config.MaxScansPerTick) return held;
 
+        scans++;
+        RoomVolume? volume = scanner.Scan(pos);
+        if (volume == null) { Drop(held); return null; }
+        if (held != null && Key(held.Room.Bounds, held.Dimension) == Key(volume.Bounds, pos.dimension))
+        {
+            // Same box, different blocks: the geometry is rebuilt and the temperature is kept.
+            held.Room = volume;
+            held.Geom = Measure(volume, held.Dimension);
+            held.Stale = false;
+            Build(held);
+            return held;
+        }
+        // A different box is a different room: the old one is saved under its own key, so patching the
+        // wall back up finds it again, and the new one starts from the air the old one had.
+        double? carried = held?.Temperature;
+        Drop(held);
+        return Track(volume, pos.dimension, carried);
+    }
+
+    private void Drop(RoomEntry? e)
+    {
+        if (e == null) return;
+        Save(e);
+        entries.Remove(Key(e.Room.Bounds, e.Dimension));
+    }
+
+    /// <summary>
+    /// Same invalidation as the vanilla registry: any block change dirties its chunk. The event fires
+    /// from whichever thread placed the block (chunk loading runs off the main one), so it only
+    /// queues, and the tick does the matching.
+    /// </summary>
+    private void OnChunkDirty(Vec3i chunkCoord, IWorldChunk chunk, EnumChunkDirtyReason reason) =>
+        dirtyChunks.Enqueue(chunkCoord);
+
+    // ponytail: one pass over the tracked rooms per dirty chunk. A base with fifty rooms and a busy
+    // chunk loader is still a few thousand integer compares a second; index the rooms by chunk if a
+    // profile ever says otherwise.
+    private void MarkDirtyRoomsStale()
+    {
+        while (dirtyChunks.TryDequeue(out Vec3i? c))
+            foreach (RoomEntry e in entries.Values)
+                if (Touches(e.Room.Bounds, c)) e.Stale = true;
+    }
+
+    /// <summary>Whether that chunk holds any part of the room, or of the shell one block around it.</summary>
+    private static bool Touches(Cuboidi b, Vec3i c)
+    {
+        const int size = GlobalConstants.ChunkSize;
+        return (b.MinX - 1) / size <= c.X && c.X <= (b.MaxX + 1) / size
+            && (b.MinY - 1) / size <= c.Y && c.Y <= (b.MaxY + 1) / size
+            && (b.MinZ - 1) / size <= c.Z && c.Z <= (b.MaxZ + 1) / size;
+    }
+
+    private RoomEntry? Track(RoomVolume room, int dim, double? startTemperature = null)
+    {
+        string key = Key(room.Bounds, dim);
         Geometry geom = Measure(room, dim);
         if (geom.Volume == 0) return null;
-        double outside = ClimateTemperature(room.Location, dim) ?? 10;
-        e = new RoomEntry
+        double outside = ClimateTemperature(room.Bounds, dim) ?? 10;
+        var e = new RoomEntry
         {
             Room = room,
             Geom = geom,
             Dimension = dim,
             OutsideTemperature = outside,
             WindTemperature = outside,
-            Temperature = outside, // a room we have never seen starts at the outside temperature
+            // A room we have never seen starts at the outside temperature.
+            Temperature = startTemperature ?? outside,
             TotalHours = sapi.World.Calendar.TotalHours,
         };
         e.GroundTemp = GroundTemperatureOf(e);
@@ -396,12 +476,12 @@ public class RoomThermalSystem : ModSystem
 
     /// <summary>Walks the bbox: volume and one <see cref="Face"/> per square metre of envelope.</summary>
     // ponytail: O(bbox × 6) with one GetBlock per face, redone only when the room changes.
-    private Geometry Measure(Room room, int dim)
+    private Geometry Measure(RoomVolume room, int dim)
     {
         var geom = new Geometry();
-        Cuboidi c = room.Location;
+        Cuboidi c = room.Bounds;
         IBlockAccessor acc = sapi.World.BlockAccessor;
-        // Room.Location holds raw coordinates (RoomRegistry.cs:359): explicit dimension.
+        // The bounds hold raw coordinates, like Room.Location did (RoomRegistry.cs:359): explicit dimension.
         var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, dim);
         BlockPos nb = pos.Copy();
 
@@ -410,13 +490,18 @@ public class RoomThermalSystem : ModSystem
                 for (int z = c.MinZ; z <= c.MaxZ; z++)
                     MeasureAirBlock(geom, room, acc, pos.Set(x, y, z), nb);
 
+        int openingYSum = 0;
         foreach (Face f in geom.Faces)
         {
             if (f.Ground) { geom.GroundConductance += f.UA; continue; }
             geom.Conductance += f.UA;
             // A face open to the air is a whole square metre of inlet; a solid one only its cracks.
-            geom.InletArea += f.Opening ? 1 : config.LeakageAreaPerFace;
+            if (!f.Opening) { geom.InletArea += config.LeakageAreaPerFace; continue; }
+            geom.InletArea += 1;
+            geom.Openings++;
+            openingYSum += f.Y;
         }
+        geom.InletY = geom.Openings == 0 ? c.MinY : (double)openingYSum / geom.Openings;
         BuildFlues(geom, acc);
         return geom;
     }
@@ -425,33 +510,46 @@ public class RoomThermalSystem : ModSystem
     /// Turns the chimney blocks sitting on the ceiling into flues. Two stacks side by side are one
     /// flue of twice the section, not two flues: what matters to the draft is the total area.
     /// </summary>
-    private void BuildFlues(Geometry geom, IBlockAccessor acc)
+    private static void BuildFlues(Geometry geom, IBlockAccessor acc)
     {
         var pending = new HashSet<BlockPos>(geom.ChimneyStarts);
-        while (pending.Count > 0)
-        {
-            BlockPos seed = pending.First();
-            pending.Remove(seed);
-            List<BlockPos> group = [seed];
-            for (int i = 0; i < group.Count; i++)
-                foreach (BlockFacing side in BlockFacing.HORIZONTALS)
-                {
-                    BlockPos n = group[i].AddCopy(side);
-                    if (pending.Remove(n)) group.Add(n);
-                }
+        while (pending.Count > 0) geom.Flues.Add(MeasureFlue(acc, Footprint(pending), geom.ChimneyBlocks));
+        SumFlues(geom);
+    }
 
-            int heightSum = 0, top = 0, open = 0;
-            foreach (BlockPos start in group)
+    /// <summary>Takes one connected horizontal footprint out of the chimney blocks left to group.</summary>
+    private static List<BlockPos> Footprint(HashSet<BlockPos> pending)
+    {
+        BlockPos seed = pending.First();
+        pending.Remove(seed);
+        List<BlockPos> group = [seed];
+        for (int i = 0; i < group.Count; i++)
+            foreach (BlockFacing side in BlockFacing.HORIZONTALS)
             {
-                (int height, int topY, bool sky) = WalkFlue(acc, start, geom.ChimneyBlocks);
-                heightSum += height;
-                if (!sky) continue;
-                open++;
-                top = Math.Max(top, topY);
+                BlockPos n = group[i].AddCopy(side);
+                if (pending.Remove(n)) group.Add(n);
             }
-            geom.Flues.Add(new Flue(seed, (int)Math.Round((double)heightSum / group.Count), group.Count, top, open == 0));
-        }
+        return group;
+    }
 
+    /// <summary>One stack: the mean height of its columns, blocked unless at least one sees the sky.</summary>
+    private static Flue MeasureFlue(IBlockAccessor acc, List<BlockPos> group, List<BlockPos> blocks)
+    {
+        int heightSum = 0, top = 0, open = 0;
+        foreach (BlockPos start in group)
+        {
+            (int height, int topY, bool sky) = WalkFlue(acc, start, blocks);
+            heightSum += height;
+            if (!sky) continue;
+            open++;
+            top = Math.Max(top, topY);
+        }
+        return new Flue(group[0], (int)Math.Round((double)heightSum / group.Count), group.Count, top, open == 0);
+    }
+
+    /// <summary>What the room's stacks add up to, counting only the ones that actually draw.</summary>
+    private static void SumFlues(Geometry geom)
+    {
         foreach (Flue f in geom.Flues)
         {
             if (f.Blocked) continue;
@@ -484,45 +582,62 @@ public class RoomThermalSystem : ModSystem
         return (height, p.Y - 1, sky);
     }
 
-    private void MeasureAirBlock(Geometry geom, Room room, IBlockAccessor acc, BlockPos pos, BlockPos nb)
+    private void MeasureAirBlock(Geometry geom, RoomVolume room, IBlockAccessor acc, BlockPos pos, BlockPos nb)
     {
         if (!room.Contains(pos)) return;
         geom.Volume++;
         foreach (BlockFacing face in BlockFacing.ALLFACES)
         {
             nb.Set(pos.X + face.Normali.X, pos.Y + face.Normali.Y, pos.Z + face.Normali.Z);
-            if (!room.Contains(nb)) AddFace(geom, acc, nb, face, pos.Y);
+            if (!room.Contains(nb)) AddFace(geom, acc, pos, nb, face);
         }
     }
 
     /// <summary>Face of an air block toward the outside of the room: wall (solid block on the room side) or opening.</summary>
-    private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face, int airY)
+    private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos pos, BlockPos nb, BlockFacing face)
     {
-        Block block = acc.GetBlock(nb);
-        // Same criterion as the vanilla RoomRegistry (RoomRegistry.cs:418): a closed door, a glass
-        // pane or a chiseled block retains heat even though its faces are not "solid".
-        if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0)
+        // The room block itself may retain on this face (a slab floor seen from the air above it):
+        // then the wall is that block, in its own material, exactly as the flood fill decided.
+        Block own = acc.GetBlock(pos);
+        if (own.Id != 0 && own.GetRetention(pos, face, EnumRetentionType.Heat) != 0)
         {
-            geom.Faces.Add(new Face(nb.Copy(), face, EnumBlockMaterial.Air, config.OpeningConductance, false, true, airY, SkyExposure(acc, nb, face)));
+            AddWall(geom, acc, own, pos, nb, face, pos.Y);
             return;
         }
-        EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
-        // The chimney block is sidesolid only downward, so the vanilla flood fill treats it as a
-        // ceiling and the room stays enclosed with the stack outside it. The behavior, not the block
+        Block block = acc.GetBlock(nb);
+        // Same criterion as the flood fill that drew this room, and as the vanilla registry
+        // (RoomRegistry.cs:418): a closed door, a glass pane or a chiseled block retains heat even
+        // though its faces are not "solid". A face the fill did not cross and that retains nothing is
+        // by construction air open to the sky, i.e. an opening.
+        if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0)
+        {
+            geom.Faces.Add(new Face(nb.Copy(), face, EnumBlockMaterial.Air, config.OpeningConductance, false, true, pos.Y, SkyExposure(acc, nb, face)));
+            return;
+        }
+        AddWall(geom, acc, block, nb, nb, face, pos.Y);
+    }
+
+    /// <param name="wallPos">The block that is the wall.</param>
+    /// <param name="outsidePos">The block beyond the face, where sun and burial are measured.</param>
+    private void AddWall(Geometry geom, IBlockAccessor acc, Block block, BlockPos wallPos, BlockPos outsidePos, BlockFacing face, int airY)
+    {
+        EnumBlockMaterial mat = block.GetBlockMaterial(acc, wallPos);
+        // The chimney block is sidesolid only downward, so the fill treats it as a ceiling and the
+        // room stays enclosed with the stack outside it. The behavior, not the block
         // code: another mod's chimney draws just as well. Inheritance included, for subclasses of it.
         if (face == BlockFacing.UP && block.HasBehavior<BlockBehaviorChimney>(withInheritance: true))
-            geom.ChimneyStarts.Add(nb.Copy());
+            geom.ChimneyStarts.Add(wallPos.Copy());
 
         // GetTerrainMapheightAt, not GetRainMapHeightAt: both return the topmost solid Y at that
         // x/z, but the rain map is updated whenever a block is placed, so the roof of any building
         // becomes the "surface" and its own walls would read as buried. The worldgen map is the
         // natural ground level and never moves (IBlockAccessor.cs:474-488). The surface block
         // itself is exposed to the air, hence the strict comparison.
-        int surfaceY = acc.GetTerrainMapheightAt(nb);
-        bool ground = nb.Y < surfaceY;
-        if (ground) { geom.GroundFaces++; geom.GroundDepthSum += surfaceY - nb.Y; }
-        geom.Faces.Add(new Face(nb.Copy(), face, mat, ground ? config.GroundContactU : config.UFor(mat), ground, false, airY,
-            ground ? 0 : SkyExposure(acc, nb, face)));
+        int surfaceY = acc.GetTerrainMapheightAt(outsidePos);
+        bool ground = outsidePos.Y < surfaceY;
+        if (ground) { geom.GroundFaces++; geom.GroundDepthSum += surfaceY - outsidePos.Y; }
+        geom.Faces.Add(new Face(wallPos.Copy(), face, mat, ground ? config.GroundContactU : config.UFor(mat), ground, false, airY,
+            ground ? 0 : SkyExposure(acc, outsidePos, face)));
     }
 
     /// <summary>
@@ -546,7 +661,7 @@ public class RoomThermalSystem : ModSystem
     // source positions and invalidate on ChunkDirty if that ever shows up in a profile.
     private void ScanSources(RoomEntry e, bool outer)
     {
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         int m = outer ? Math.Max(1, config.SourceScanMargin) : 1;
         var scan = default(Scan);
         var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, e.Dimension);
@@ -594,7 +709,7 @@ public class RoomThermalSystem : ModSystem
     /// </summary>
     private double FlueWatts(RoomEntry e) => e.Geom.FlueColumns > 0 ? config.FlueLossFraction * e.SmokeWatts : 0;
 
-    private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Location, e.Dimension) ?? e.OutsideTemperature;
+    private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Bounds, e.Dimension) ?? e.OutsideTemperature;
 
     /// <summary>null if the region isn't loaded: the caller keeps the previous value.</summary>
     private double? ClimateTemperature(Cuboidi c, int dim) =>
@@ -627,7 +742,7 @@ public class RoomThermalSystem : ModSystem
         if (e.Land == null)
         {
             ClimateCondition? c = sapi.World.BlockAccessor.GetClimateAt(
-                Center(e.Room.Location, e.Dimension), EnumGetClimateMode.WorldGenValues);
+                Center(e.Room.Bounds, e.Dimension), EnumGetClimateMode.WorldGenValues);
             if (c != null) e.Land = (c.GeologicActivity, c.ForestDensity);
         }
         return e.Land ?? (0, 0);
@@ -644,7 +759,7 @@ public class RoomThermalSystem : ModSystem
     private (double Mean, double Amplitude, double ColdestDay) SampleSurfaceClimate(RoomEntry e)
     {
         IGameCalendar cal = sapi.World.Calendar;
-        BlockPos pos = Center(e.Room.Location, e.Dimension);
+        BlockPos pos = Center(e.Room.Bounds, e.Dimension);
         double yearStart = Math.Floor(cal.TotalDays / cal.DaysPerYear) * cal.DaysPerYear;
         double sum = 0, min = double.MaxValue, max = double.MinValue, coldestDay = 0;
         for (int i = 0; i < 12; i++)
@@ -700,15 +815,17 @@ public class RoomThermalSystem : ModSystem
     private void UpdateDraftAndSmoke(RoomEntry e, double dtSeconds)
     {
         Geometry g = e.Geom;
-        double ceiling = LocalTemperature(e, e.Room.Location.MaxY);
-        // The inlet is half a metre above the floor: the cracks the draft pulls through are spread
-        // over the whole envelope, and milestone 6 will put the real openings' mean height here.
+        double ceiling = LocalTemperature(e, e.Room.Bounds.MaxY);
+        // The inlet sits half a metre above the mean height of the openings, or above the floor when
+        // there are none and the air comes in through cracks spread over the whole envelope.
         e.DraftFlow = Chimney.Draft(config.DischargeCoefficient, g.FlueColumns, g.InletArea,
-            g.FlueTopY - (e.Room.Location.MinY + 0.5), ceiling, e.OutsideTemperature);
+            g.FlueTopY - (g.InletY + 0.5), ceiling, e.OutsideTemperature);
         e.DraftConductance = Chimney.Conductance(e.DraftFlow);
         e.DraftWatts = -e.DraftConductance * (ceiling - e.Temperature);
+        // An open window renews the air on its own, draft or no draft.
         e.Smoke = Chimney.Smoke(e.Smoke, e.SmokeSources * config.SmokePerSourcePerHour,
-            Chimney.AirChanges(e.DraftFlow, g.Volume, BaseAirChanges), dtSeconds / 3600);
+            Chimney.AirChanges(e.DraftFlow, g.Volume, BaseAirChanges + config.OpeningAirChangesPerFace * g.Openings),
+            dtSeconds / 3600);
     }
 
     private double SolAir(RoomEntry e, in Face f) =>
@@ -727,7 +844,7 @@ public class RoomThermalSystem : ModSystem
     /// </summary>
     private void UpdateSunFactors(RoomEntry e)
     {
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         IGameCalendar cal = sapi.World.Calendar;
         Vec3f sun = cal.GetSunPosition(new Vec3d((c.MinX + c.MaxX) / 2.0, c.MaxY, (c.MinZ + c.MaxZ) / 2.0), cal.TotalDays);
         e.Daylight = Math.Max(0, sun.Y);
@@ -745,7 +862,7 @@ public class RoomThermalSystem : ModSystem
     /// </summary>
     private Vec3d WindAt(RoomEntry e)
     {
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         return sapi.World.BlockAccessor.GetWindSpeedAt(
             new BlockPos((c.MinX + c.MaxX) / 2, c.MaxY + 2, (c.MinZ + c.MaxZ) / 2, e.Dimension));
     }
@@ -762,7 +879,7 @@ public class RoomThermalSystem : ModSystem
     {
         double speed = Horizontal(e.Wind);
         if (speed <= 0) return e.OutsideTemperature;
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         double d = config.WindSampleDistance * Math.Clamp(speed / 0.5, 0, 1) / speed;
         var pos = new BlockPos((int)((c.MinX + c.MaxX) / 2.0 - e.Wind.X * d), 0,
                                (int)((c.MinZ + c.MaxZ) / 2.0 - e.Wind.Z * d), e.Dimension);
@@ -787,7 +904,7 @@ public class RoomThermalSystem : ModSystem
     private static double Horizontal(Vec3d v) => Math.Sqrt(v.X * v.X + v.Z * v.Z);
 
     /// <summary>Mid height of the room, in block coordinates (block y spans y..y+1).</summary>
-    private static double YMid(RoomEntry e) => (e.Room.Location.MinY + e.Room.Location.MaxY + 1) / 2.0;
+    private static double YMid(RoomEntry e) => (e.Room.Bounds.MinY + e.Room.Bounds.MaxY + 1) / 2.0;
 
     private static double LocalTemperature(RoomEntry e, int y) => Stratification.At(e.Temperature, e.Gradient, y, YMid(e));
 
@@ -833,7 +950,7 @@ public class RoomThermalSystem : ModSystem
         Geometry g = e.Geom;
         if (g.Flues.Count == 0) return null;
         return new DraftState((int)Math.Round(g.FlueHeight), g.FlueColumns, g.FlueColumns == 0,
-            e.DraftFlow, e.DraftConductance * (e.OutsideTemperature - LocalTemperature(e, e.Room.Location.MaxY)),
+            e.DraftFlow, e.DraftConductance * (e.OutsideTemperature - LocalTemperature(e, e.Room.Bounds.MaxY)),
             g.InletArea, g.ChimneyBlocks);
     }
 
@@ -845,7 +962,7 @@ public class RoomThermalSystem : ModSystem
     /// <summary>Server chunk holding the room's min corner. World coordinates are never negative.</summary>
     private IServerChunk? ChunkOf(RoomEntry e)
     {
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         return sapi.World.BlockAccessor.GetChunkAtBlockPos(new BlockPos(c.MinX, c.MinY, c.MinZ, e.Dimension)) as IServerChunk;
     }
 
@@ -854,7 +971,7 @@ public class RoomThermalSystem : ModSystem
         IServerChunk? chunk = ChunkOf(e);
         if (chunk == null) return;
         Dictionary<string, Saved> all = Read(chunk);
-        all[Key(e.Room.Location, e.Dimension)] = new Saved(e.Temperature, e.TotalHours);
+        all[Key(e.Room.Bounds, e.Dimension)] = new Saved(e.Temperature, e.TotalHours);
         Write(chunk, all);
     }
 
@@ -909,7 +1026,7 @@ public class RoomThermalSystem : ModSystem
     }
 
     private static bool InColumn(RoomEntry e, Vec3i c) =>
-        e.Room.Location.MinX / GlobalConstants.ChunkSize == c.X && e.Room.Location.MinZ / GlobalConstants.ChunkSize == c.Z;
+        e.Room.Bounds.MinX / GlobalConstants.ChunkSize == c.X && e.Room.Bounds.MinZ / GlobalConstants.ChunkSize == c.Z;
 
     // --- Spoilage ----------------------------------------------------------------------------
 
@@ -928,7 +1045,7 @@ public class RoomThermalSystem : ModSystem
     /// </summary>
     public bool TryGetPerishRate(BlockPos pos, out float rate)
     {
-        RoomEntry? e = Find(pos) ?? Discover(pos);
+        RoomEntry? e = Discover(pos);
         rate = (float)PerishRate(e == null ? 0 : LocalTemperature(e, pos.Y));
         return e != null;
     }
@@ -936,26 +1053,27 @@ public class RoomThermalSystem : ModSystem
     /// <summary>
     /// A container asking for its perish rate in a room no player has ever entered: track it, so a
     /// cellar is discovered by its own crocks. Called from the container's 10 s tick, on the server
-    /// main thread, which is the only place RoomRegistry may be used. Positions that turn out not to
-    /// be in a room are remembered per chunk for a minute, so an outdoor chest costs one flood fill
-    /// per minute instead of one per tick.
+    /// main thread, which is the only place the flood fill may run. Positions that turn out not to be
+    /// in a room are remembered per chunk for a minute, so an outdoor chest costs one flood fill per
+    /// minute instead of one per tick.
     /// </summary>
     private RoomEntry? Discover(BlockPos pos)
     {
+        RoomEntry? held = Find(pos);
+        if (held is { Stale: false }) return held;
         double now = sapi.World.Calendar.TotalHours;
         var chunk = (pos.X / GlobalConstants.ChunkSize, pos.Y / GlobalConstants.ChunkSize, pos.Z / GlobalConstants.ChunkSize);
-        if (noRoom.TryGetValue(chunk, out double until) && now < until) return null;
+        if (noRoom.TryGetValue(chunk, out double until) && now < until) return held;
 
-        Room room = rooms.GetRoomForPosition(pos);
-        if (!Enclosed(room))
-        {
-            if (noRoom.Count > 256)
-                foreach (var stale in noRoom.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList()) noRoom.Remove(stale);
-            noRoom[chunk] = now + NoRoomTtlHours;
-            return null;
-        }
-        noRoom.Remove(chunk);
-        return Track(room, pos.dimension);
+        int before = scans;
+        RoomEntry? found = RoomAt(pos);
+        if (found != null) { noRoom.Remove(chunk); return found; }
+        // Nothing scanned means the tick's budget was spent, which is not a verdict on this position.
+        if (scans == before) return null;
+        if (noRoom.Count > 256)
+            foreach (var expired in noRoom.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList()) noRoom.Remove(expired);
+        noRoom[chunk] = now + NoRoomTtlHours;
+        return null;
     }
 
     private RoomEntry? Find(BlockPos pos) =>
@@ -995,8 +1113,8 @@ public class RoomThermalSystem : ModSystem
                      $"(+{(calm <= 0 ? 0 : 100 * e.WindConductance / calm):0.#} % losses, " +
                      $"forest shelter {100 * (1 - e.Shelter):0.#} %)").AppendLine();
         sb.Append(c, $"Sun: {e.Daylight:0.0#} (forest shade {1 - e.Shade:0.0#}, +{e.SolarWatts:0} W)").AppendLine();
-        sb.Append(c, $"Stratification: {e.Gradient:0.0} K/m (floor {LocalTemperature(e, e.Room.Location.MinY):0.0} °C, " +
-                     $"eyes {local:0.0} °C, ceiling {LocalTemperature(e, e.Room.Location.MaxY):0.0} °C)").AppendLine();
+        sb.Append(c, $"Stratification: {e.Gradient:0.0} K/m (floor {LocalTemperature(e, e.Room.Bounds.MinY):0.0} °C, " +
+                     $"eyes {local:0.0} °C, ceiling {LocalTemperature(e, e.Room.Bounds.MaxY):0.0} °C)").AppendLine();
         sb.Append(c, $"Perish rate: {PerishRate(local):0.00}x (vanilla here: {PerishRate(VanillaClimate(e)):0.00}x)").AppendLine();
         // The wind's share is on the Wind line: this one is the fabric of the building, calm air.
         sb.Append(c, $"Losses: {calm:0.0} W/K, i.e. " +
@@ -1009,18 +1127,23 @@ public class RoomThermalSystem : ModSystem
     }
 
     /// <summary>The chimney and what it is doing to the air, two lines at most.</summary>
-    private void AppendFlue(StringBuilder sb, CultureInfo c, RoomEntry e)
+    private static void AppendFlue(StringBuilder sb, CultureInfo c, RoomEntry e)
     {
         Geometry g = e.Geom;
         if (g.Flues.Count == 0) sb.Append("Flue: none").AppendLine();
         else if (g.FlueColumns == 0) sb.Append("Flue: blocked (roof over the stack)").AppendLine();
         else
             sb.Append(c, $"Flue: {g.FlueHeight:0.#} m, {g.FlueColumns} column{(g.FlueColumns == 1 ? "" : "s")}, " +
-                         $"draft {e.DraftFlow:0.00} m³/s ({-e.DraftConductance * (LocalTemperature(e, e.Room.Location.MaxY) - e.OutsideTemperature):0} W), " +
-                         $"inlet leakage {g.InletArea:0.00} m²").AppendLine();
+                         $"draft {e.DraftFlow:0.00} m³/s ({-e.DraftConductance * (LocalTemperature(e, e.Room.Bounds.MaxY) - e.OutsideTemperature):0} W), " +
+                         $"{Inlet(c, g)}").AppendLine();
         if (e.Smoke > 0.1 || e.SmokeSources > 0)
             sb.Append(c, $"Smoke: {Chimney.Level(e.Smoke)} ({e.Smoke:0.00}), {e.SmokeSources} source{(e.SmokeSources == 1 ? "" : "s")}").AppendLine();
     }
+
+    /// <summary>Where the draft gets its air: a real opening if the room has one, cracks otherwise.</summary>
+    private static string Inlet(CultureInfo c, Geometry g) => g.Openings == 0
+        ? string.Create(c, $"inlet leakage {g.InletArea:0.00} m²")
+        : string.Create(c, $"inlet {g.InletArea:0.0} m² ({g.Openings} opening{(g.Openings == 1 ? "" : "s")}) at y {g.InletY:0}");
 
     private static void AppendWalls(StringBuilder sb, CultureInfo c, string title, IEnumerable<Face> faces, double dT)
     {
@@ -1058,7 +1181,7 @@ public class RoomThermalSystem : ModSystem
     /// </summary>
     private double VanillaClimate(RoomEntry e)
     {
-        Cuboidi c = e.Room.Location;
+        Cuboidi c = e.Room.Bounds;
         return sapi.World.BlockAccessor.GetClimateAt(new BlockPos((c.MinX + c.MaxX) / 2, sapi.World.SeaLevel, (c.MinZ + c.MaxZ) / 2, e.Dimension),
             EnumGetClimateMode.ForSuppliedDate_TemperatureOnly, sapi.World.Calendar.TotalDays).Temperature;
     }

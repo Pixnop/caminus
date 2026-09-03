@@ -4,7 +4,11 @@ Building thermal simulation for Vintage Story. Each room has a temperature, the 
 walls leak according to their material, the chimney draws. Food spoilage and player comfort follow
 the actual temperature.
 
-Status: milestone 1 in progress (see `docs/roadmap.md`). Target: Vintage Story 1.22.7, .NET 10.
+Rooms are found by Caminus's own flood fill, so a hall wider than the game's 14-block limit is one
+room, and a doorway or a window leaves the room standing as an opening that leaks, lets the wind in,
+feeds the chimney its air and clears the smoke, instead of turning the whole building into outdoors.
+
+Status: milestone 6 done (see `docs/roadmap.md`). Target: Vintage Story 1.22.7, .NET 10.
 
 ## Overlay
 

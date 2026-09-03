@@ -18,6 +18,10 @@
   "leakageAreaPerFace": 0.003,
   "flueLossFraction": 0.4,
   "smokePerSourcePerHour": 2.0,
+  "openingAirChangesPerFace": 2.0,
+  "maxRoomBlocks": 4096,
+  "maxRoomExtent": 48,
+  "maxScansPerTick": 2,
   "smokeDamage": false,
   "wallU": {
     "Stone": 3.0,

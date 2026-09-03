@@ -419,6 +419,49 @@ entity API call available since long before this version. The tick gate (`SmokeD
 the mod's 1 s tick) keeps it at 0.5 HP roughly every 10 s while a room stays at or above the heavy-smoke
 threshold, and it is off by default so a server owner opts in after judging the balance in play.
 
+## 15. Our own flood fill: rain map, caching accessor, ChunkDirty (verified 2026-09-03)
+
+### The rain map is what "open to the sky" means
+
+`IMapChunk.RainHeightMap` is one `ushort` per column of a map chunk holding **the Y of the topmost
+block whose `RainPermeable` is false**, and `BlockAccessorBase.UpdateRainHeightMap` (l.791) keeps it
+current on every `SetBlock`: placing a non-permeable block raises it to `max(current, pos.Y)`,
+removing the block that *was* the maximum walks back down the column until it finds another one.
+`RainPermeable` is a plain `Block` field (Block.cs:323) that defaults to false. The air block is
+registered in code with it set to true (`ServerSystemBlockSimulation.OnBeginInitialization`, l.67),
+the missing-block placeholder likewise (`BlockList.getNoBlock`, l.229), and across the whole survival
+domain exactly three JSON blocks declare it, all water lilies. So every wall, roof and chimney course
+counts from the moment it is placed.
+
+That gives Caminus's boundary test for free: `GetRainMapHeightAt(pos) <= pos.Y` means nothing above
+that position stops rain, i.e. the position is outdoors. The flood fill refuses such a position as a
+seed and stops at it as an opening, which is why an outdoor player never starts a room and a hole in
+a wall does. Two traps: an unloaded map chunk answers **0**, which reads as "open to the sky" and
+stops the fill instead of running it into blocks nobody has loaded (the safe way round), and
+`GetTerrainMapheightAt` is a different map entirely, the worldgen one, which is what the buried-face
+test uses (section 9).
+
+Order matters when a test builds a box: the rain map only reflects the blocks already placed, so a
+shell built bottom to top is only enclosed once its roof course is down.
+
+### `ICachingBlockAccessor`
+
+`api.World.GetCachingBlockAccessor(synchronize: false, relight: false)` (IWorldAccessor.cs:739),
+same call the vanilla registry makes. `Begin()` starts a fresh caching window and must be called at
+the top of every fill; `LastChunkLoaded` says whether the last `GetBlock` had its chunk. Vanilla
+keeps its instance in a `[ThreadStatic]` field and disposes them from a
+`ConcurrentDictionary`; Caminus has one field and disposes it in `ModSystem.Dispose`, because the
+scan only ever runs on the server main thread.
+
+### `ChunkDirty`
+
+`event ChunkDirtyDelegate ChunkDirty` lives on `IEventAPI` (IEventAPI.cs:49), so it is reachable
+from `sapi.Event`. Server side it is fired from `ServerWorldMap.MarkChunkDirty` (l.319, reason
+`MarkedDirty`) and from `ServerSystemSupplyChunks` (l.599, reason `NewlyLoaded`), the second of which
+runs off the main thread. Vanilla takes a lock in its handler; Caminus queues the chunk coordinate in
+a `ConcurrentQueue` and does the matching against the tracked rooms at the top of its own tick, which
+costs nothing on the calling thread and keeps the room table single threaded.
+
 ## Names cited from memory vs. reality
 
 | Cited | Real |

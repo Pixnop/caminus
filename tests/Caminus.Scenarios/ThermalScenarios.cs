@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
@@ -483,21 +484,25 @@ public partial class ThermalScenarios : AtlasScenarioBase
     /// one of its walls in the neighbouring chunk, and SetBlock into a chunk the server has not
     /// loaded yet does nothing at all: the wall would silently be missing and the room would leak.
     /// </summary>
-    private async Task WaitForShellChunks(BlockPos min)
+    private async Task WaitForShellChunks(BlockPos min, int sx = Inner, int sy = Inner, int sz = Inner)
     {
         Vintagestory.API.Common.IBlockAccessor acc = World.Api.World.BlockAccessor;
-        await World.Until(() => acc.GetChunkAtBlockPos(min.Offset(-1, -1, -1)) != null
-                             && acc.GetChunkAtBlockPos(min.Offset(Inner, Inner, Inner)) != null, 1200);
+        List<BlockPos> corners = [];
+        foreach (int x in (int[])[-1, sx])
+            foreach (int y in (int[])[-1, sy])
+                foreach (int z in (int[])[-1, sz])
+                    corners.Add(min.Offset(x, y, z));
+        await World.Until(() => corners.TrueForAll(p => acc.GetChunkAtBlockPos(p) != null), 1200);
     }
 
     /// <summary>Hollow shell around the interior whose bottom corner is <paramref name="min"/>.</summary>
-    private void Build(BlockPos min, string wall)
+    private void Build(BlockPos min, string wall, int sx = Inner, int sy = Inner, int sz = Inner)
     {
-        for (int x = -1; x <= Inner; x++)
-            for (int y = -1; y <= Inner; y++)
-                for (int z = -1; z <= Inner; z++)
+        for (int x = -1; x <= sx; x++)
+            for (int y = -1; y <= sy; y++)
+                for (int z = -1; z <= sz; z++)
                 {
-                    bool shell = x < 0 || y < 0 || z < 0 || x == Inner || y == Inner || z == Inner;
+                    bool shell = x < 0 || y < 0 || z < 0 || x == sx || y == sy || z == sz;
                     World.SetBlock(shell ? wall : Air, min.Offset(x, y, z));
                 }
     }
@@ -860,5 +865,93 @@ public partial class ThermalScenarios : AtlasScenarioBase
             Assert.DoesNotContain("flue takes", report);
         }
         finally { await Leave(player); }
+    }
+
+    // --- Milestone 6: our own room detection ---------------------------------------------------
+
+    /// <summary>
+    /// A 20x4x20 hall: past the vanilla registry's 14-block limit on two axes, so the game itself
+    /// calls it an open volume, and Caminus's own flood fill keeps it. Also where one scan is timed.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Hall_wider_than_the_vanilla_limit_is_a_room()
+    {
+        ITestPlayer player = await World.JoinPlayer("CaminusHall");
+        try
+        {
+            BlockPos min = World.Spawn.Offset(1260, 30, 40);
+            await player.TeleportTo(World.Spawn.Offset(1260, 0, 40));
+            await WaitForShellChunks(min, 20, 4, 20);
+            Build(min, Stone, 20, 4, 20);
+            BlockPos inside = min.Offset(10, 1, 10);
+            await player.TeleportTo(inside);
+
+            Assert.True(World.Api.ModLoader.GetModSystem<RoomRegistry>().GetRoomForPosition(inside).ExitCount > 0,
+                "the vanilla flood fill was expected to give up on a hall this wide");
+
+            string report = await WaitForRoomReport(inside);
+            Assert.Contains("Volume 1600 blocks", report);
+            // Floor and ceiling are 20x20 each, the four walls 20x4: 800 + 320 = 1120 faces.
+            Assert.Contains("Stone: 1120 faces", report);
+            Assert.DoesNotContain("Openings", report);
+
+            using var scanner = new RoomScanner(World.Api, 4096, 48);
+            Stopwatch clock = Stopwatch.StartNew();
+            RoomVolume? volume = scanner.Scan(inside);
+            clock.Stop();
+            Assert.NotNull(volume);
+            Console.WriteLine($"[Caminus] one flood fill of the 20x4x20 hall: {clock.Elapsed.TotalMilliseconds:0.00} ms");
+        }
+        finally { await Leave(player); }
+    }
+
+    /// <summary>
+    /// A hole in a wall is an opening the model prices, not an exit that costs the room its
+    /// existence. The same box twice, one of them missing a wall block at floor level: it stays a
+    /// room, the opening shows up in the report, and it gives the chimney a real inlet instead of the
+    /// envelope's cracks, so the same 4-block stack draws harder.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Window_is_an_opening_not_an_exit()
+    {
+        (ITestPlayer shutPlayer, BlockPos shutRoom) = await RoomAndPlayer("CaminusNoWindow", 1340, Stone);
+        (ITestPlayer openPlayer, BlockPos openRoom) = await RoomAndPlayer("CaminusWindow", 1400, Stone);
+        try
+        {
+            SetWindPattern("still"); // this comparison reads instantaneous draft: keep the wind out of it
+            // The middle block of the north wall, at interior floor level. What replaces it is real
+            // air whose own column is still under the roof, so it joins the room, and the block
+            // beyond it sees the sky, which is where the room ends.
+            World.SetBlock(Air, openRoom.Offset(0, -1, -2));
+
+            string open = await WaitForRoomReport(openRoom, r => r.Contains("Openings: 1 faces"));
+            Assert.Contains("Room:", open);
+            Assert.Contains("Volume 28 blocks", open); // the 27 interior blocks plus the hole itself
+            Assert.Contains("Stone: 57 faces", open);  // 54 of the box, minus the one the hole opened, plus its own 4
+
+            BlockPos shutFire = shutRoom.Offset(0, -1, 0), openFire = openRoom.Offset(0, -1, 0);
+            LightFirepit(shutFire);
+            LightFirepit(openFire);
+            await World.Until(() => Firepit(shutFire)?.IsBurning == true && Firepit(openFire)?.IsBurning == true);
+            BuildChimney(shutFire, 4);
+            BuildChimney(openFire, 4);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+
+            await WaitForRoomReport(shutRoom, r => r.Contains("Flue: 4 m, 1 column"));
+            await WaitForRoomReport(openRoom, r => r.Contains("Flue: 4 m, 1 column"));
+            await World.Ticks(300);
+
+            open = await ReportAt(openRoom);
+            string shut = await ReportAt(shutRoom);
+            Assert.Contains("(1 opening)", open);
+            Assert.Contains("inlet leakage", shut);
+            Assert.True(Read(DraftFlow(), open) > Read(DraftFlow(), shut),
+                $"the window drew no better than the cracks\nwindow:\n{open}\nsealed:\n{shut}");
+        }
+        finally
+        {
+            await Leave(shutPlayer);
+            await Leave(openPlayer);
+        }
     }
 }
