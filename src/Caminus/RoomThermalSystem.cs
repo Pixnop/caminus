@@ -629,7 +629,7 @@ public class RoomThermalSystem : ModSystem
             faces.Add(new FaceFlow(f, f.UA + extra,
                 f.UA * (local - node - sol) + extra * (local - e.WindTemperature)));
         }
-        double geologic = Land(e).Geologic;
+        (double geologic, double forest) = Land(e);
         flows = new RoomFlows(e.Temperature, e.OutsideTemperature,
             e.Geom.GroundFaces == 0 ? double.NaN : e.GroundTemp, e.WindTemperature,
             e.Wind, e.Gradient, yMid, e.StratificationWatts, faces, e.SolarWatts, geologic, forest);
