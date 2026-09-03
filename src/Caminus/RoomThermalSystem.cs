@@ -701,7 +701,7 @@ public class RoomThermalSystem : ModSystem
     /// <summary>
     /// Compass direction the wind blows FROM. Vintage Story axes: +X east, +Z south.
     /// </summary>
-    private static string ComesFrom(Vec3d wind)
+    public static string ComesFrom(Vec3d wind)
     {
         string[] names = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
         return names[(int)Math.Round(Math.Atan2(-wind.X, wind.Z) / (Math.PI / 4)) & 7];

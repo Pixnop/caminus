@@ -39,6 +39,9 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [GeneratedRegex(@"Losses: (-?\d+(?:\.\d+)?) W/K")]
     private static partial Regex Losses();
 
+    [GeneratedRegex(@"Losses: -?\d+(?:\.\d+)? W/K, i\.e\. (-?\d+) W")]
+    private static partial Regex LossWatts();
+
     [GeneratedRegex(@"Ground node: (-?\d+(?:\.\d+)?) °C")]
     private static partial Regex GroundTemp();
 
@@ -271,6 +274,44 @@ public partial class ThermalScenarios : AtlasScenarioBase
         // Calling it here instead of waiting for that tick keeps the scenario 10 s shorter.
         ContainerPerishRate(chest);
         Assert.Contains("Room:", await ReportAt(chest));
+    }
+
+    /// <summary>
+    /// The server half of the overlay. Atlas has no client, so the highlight cubes and the HUD text
+    /// are checked where they are built, and the per-face flows are checked against the same room's
+    /// /caminus temp report: the overlay and the report must not tell two different stories.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Overlay_describes_the_room()
+    {
+        BlockPos inside = await Room("CaminusOverlay", 480, Stone);
+        LightFirepit(inside.Offset(0, -1, 0));
+        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+        await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
+
+        // About three time constants (27 m³ x 6030 J/K/m³ over 162 W/K), so the room settles near
+        // its 4000 W / 162 W/K = +25 K equilibrium and every face, floor included, loses heat.
+        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+        await World.Ticks(300);
+        // The Losses line is the calm envelope only, the faces also carry the wind: compare the two
+        // on a still day, where the wind is worth under 2 % of a 162 W/K box.
+        string report = await WindReport(inside, "still", r => WindBelow(r, 0.05));
+
+        RoomThermalSystem thermal = World.Api.ModLoader.GetModSystem<RoomThermalSystem>();
+        Assert.True(thermal.TryGetFaceFlows(inside, out RoomFlows? flows), report);
+        Assert.Equal(54, flows!.Faces.Count);
+        Assert.True(flows.Temperature > flows.OutsideTemperature + 5,
+            $"the firepit barely warmed the room, nothing to look at\n{report}");
+        Assert.DoesNotContain(flows.Faces, f => f.Watts <= 0);
+
+        double sum = flows.Faces.Sum(f => f.Watts), losses = Read(LossWatts(), report);
+        Assert.True(Math.Abs(sum - losses) < 0.05 * losses,
+            $"the faces add up to {sum:0} W, the report says {losses:0} W\n{report}");
+
+        (List<BlockPos> blocks, List<int> colors) = OverlayServer.Highlights(flows);
+        Assert.Equal(54, blocks.Count);
+        Assert.Equal(blocks.Count, colors.Count);
+        Assert.StartsWith("Room ", OverlayServer.Describe(flows, inside.Y));
     }
 
     // Room_temperature_survives_a_restart is NOT an Atlas scenario. [AtlasScenario(RestartWorld = true)]
