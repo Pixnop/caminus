@@ -73,6 +73,9 @@ scenarios). After the first in-game test the order changed:
   1600 blocks and 1120 stone faces) and `Window_is_an_opening_not_an_exit` (one wall block removed at
   floor level reads as `Openings: 1 faces`, the room survives, and the same 4-block chimney draws
   harder than in the sealed twin). Details: `api-1.22.7-verification.md` section 15.
+- Balancing knob: `comfortOffsetK` in `assets/caminus/config/thermal.json` (default 0) is added to the
+  room air the body reads before vanilla's comfort formula, so a server owner can move the neutral
+  point (vanilla's `bodyTemperatureResistance`, about 0 °C) without touching code.
 - Next: compatibility passes against the ModDB neighbours, and balancing from playtests.
 
 ## Milestone 0: skeleton (1 to 2 days)

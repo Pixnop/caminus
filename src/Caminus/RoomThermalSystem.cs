@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
@@ -61,6 +62,12 @@ public class ThermalConfig
     public int MaxScansPerTick { get; set; } = 2;
     /// <summary>Whether heavy smoke hurts. Off by default: the server owner decides after playing.</summary>
     public bool SmokeDamage { get; set; }
+    /// <summary>
+    /// K added to the room air the body reads, before vanilla's comfort formula. Moves the neutral
+    /// point (vanilla's <c>bodyTemperatureResistance</c>, 0 °C by default) without touching code:
+    /// +5 makes a 0 °C room feel like 5 °C.
+    /// </summary>
+    public double ComfortOffsetK { get; set; }
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
 
     public double UFor(EnumBlockMaterial mat) => WallU.TryGetValue(mat, out double u) ? u : 3.0;
@@ -276,7 +283,23 @@ public class RoomThermalSystem : ModSystem
         api.Event.GameWorldSave += () => { foreach (RoomEntry e in entries.Values) Save(e); };
     }
 
+    /// <summary>Wall clock the last mod tick took, in ms. Read by the performance scenario.</summary>
+    public double LastTickMilliseconds { get; private set; }
+
+    /// <summary>How many rooms the tick above is currently simulating.</summary>
+    public int TrackedRooms => entries.Count;
+
+    /// <summary><see cref="ThermalConfig.ComfortOffsetK"/>, for the body temperature behavior.</summary>
+    public double ComfortOffsetK => config.ComfortOffsetK;
+
     private void OnTick(float dtRealSeconds)
+    {
+        long started = Stopwatch.GetTimestamp();
+        TickRooms(dtRealSeconds);
+        LastTickMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+    }
+
+    private void TickRooms(float dtRealSeconds)
     {
         if (dtRealSeconds <= 0) return;
         scans = 0;

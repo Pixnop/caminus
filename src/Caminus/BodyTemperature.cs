@@ -171,9 +171,11 @@ public class EntityBehaviorCaminusBodyTemperature : EntityBehaviorBodyTemperatur
         // CAMINUS CHANGE 1 (vanilla l.259 reads climateAt.Temperature): inside a room the mod
         // tracks, the air is the room node's at the player's own eye height. Rain and wetness below
         // keep using the climate: they are about the sky, not the air.
+        // comfortOffsetK shifts the room air the comfort formula below sees, so a server owner can
+        // move vanilla's neutral point (bodyTemperatureResistance, 0 °C) without touching code.
         double roomAir = 0;
         bool tracked = thermal != null && thermal.TryGetLocalTemperature(RoomThermalSystem.EyeBlockPos(entity), out roomAir);
-        airTemperature = tracked ? (float)roomAir : climateAt.Temperature;
+        airTemperature = tracked ? (float)(roomAir + thermal!.ComfortOffsetK) : climateAt.Temperature;
 
         // vanilla l.245-255: rain wetness, head slot protection, drying by nearby fire.
         float num = climateAt.Rainfall * (flag ? 0.06f : 0f) * ((climateAt.Temperature < -1f) ? 0.05f : 1f);

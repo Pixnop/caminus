@@ -23,6 +23,7 @@
   "maxRoomExtent": 48,
   "maxScansPerTick": 2,
   "smokeDamage": false,
+  "comfortOffsetK": 0,
   "wallU": {
     "Stone": 3.0,
     "Brick": 2.5,
