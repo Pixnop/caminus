@@ -81,16 +81,22 @@ public sealed class RoomScanner(ICoreServerAPI api, int maxBlocks, int maxExtent
                 // Vanilla (RoomRegistry.cs:398) first asks the block we are leaving whether its own
                 // face retains heat: a slab floor stops the fill even though its top is walkable air.
                 if (here.Id != 0 && here.GetRetention(cur, face, EnumRetentionType.Heat) != 0) continue;
-                int nx = dx + face.Normali.X, ny = dy + face.Normali.Y, nz = dz + face.Normali.Z;
-                if (!Traversable(acc, nb.Set(seed.X + nx, seed.Y + ny, seed.Z + nz), face)) continue;
-                if (!Grow(box, nx, ny, nz)) return null;
-                int index = Index(nx, ny, nz);
-                if (!visited.Add(index)) continue;
-                if (visited.Count > maxBlocks) return null;
-                queue.Enqueue(index);
+                if (!Visit(acc, seed, nb, box, dx + face.Normali.X, dy + face.Normali.Y, dz + face.Normali.Z, face)) return null;
             }
         }
         return Build(seed, box);
+    }
+
+    /// <summary>Crosses into one neighbour if the fill may. False when a budget is exceeded.</summary>
+    private bool Visit(ICachingBlockAccessor acc, BlockPos seed, BlockPos nb, Cuboidi box, int nx, int ny, int nz, BlockFacing face)
+    {
+        if (!Traversable(acc, nb.Set(seed.X + nx, seed.Y + ny, seed.Z + nz), face)) return true;
+        if (!Grow(box, nx, ny, nz)) return false;
+        int index = Index(nx, ny, nz);
+        if (!visited.Add(index)) return true;
+        if (visited.Count > maxBlocks) return false;
+        queue.Enqueue(index);
+        return true;
     }
 
     /// <summary>

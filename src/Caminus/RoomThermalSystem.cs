@@ -406,8 +406,8 @@ public class RoomThermalSystem : ModSystem
     private void MarkDirtyRoomsStale()
     {
         while (dirtyChunks.TryDequeue(out Vec3i? c))
-            foreach (RoomEntry e in entries.Values)
-                if (Touches(e.Room.Bounds, c)) e.Stale = true;
+            foreach (RoomEntry e in entries.Values.Where(e => Touches(e.Room.Bounds, c)))
+                e.Stale = true;
     }
 
     /// <summary>Whether that chunk holds any part of the room, or of the shell one block around it.</summary>
@@ -1141,9 +1141,12 @@ public class RoomThermalSystem : ModSystem
     }
 
     /// <summary>Where the draft gets its air: a real opening if the room has one, cracks otherwise.</summary>
-    private static string Inlet(CultureInfo c, Geometry g) => g.Openings == 0
-        ? string.Create(c, $"inlet leakage {g.InletArea:0.00} m²")
-        : string.Create(c, $"inlet {g.InletArea:0.0} m² ({g.Openings} opening{(g.Openings == 1 ? "" : "s")}) at y {g.InletY:0}");
+    private static string Inlet(CultureInfo c, Geometry g)
+    {
+        if (g.Openings == 0) return string.Create(c, $"inlet leakage {g.InletArea:0.00} m²");
+        string plural = g.Openings == 1 ? "" : "s";
+        return string.Create(c, $"inlet {g.InletArea:0.0} m² ({g.Openings} opening{plural}) at y {g.InletY:0}");
+    }
 
     private static void AppendWalls(StringBuilder sb, CultureInfo c, string title, IEnumerable<Face> faces, double dT)
     {
