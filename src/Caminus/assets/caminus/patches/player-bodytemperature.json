@@ -1,0 +1,16 @@
+[
+  {
+    "comment": "FRAGILE, BY DESIGN. ClassRegistry.RegisterentityBehavior uses Dictionary.Add (VintagestoryLib, ClassRegistry.cs:442), so 'bodytemperature' cannot be re-registered with our subclass: the entity has to name ours instead. JsonPatch has no way to address an array element by value, so this is the index of the bodytemperature entry in 1.22.7's game:entities/humanoid/player.json (client behaviors, line 326). Vanilla patches player.json the same way (survival/patches/playerhealthpoints.json points at /server/behaviors/4). If a game update or another mod shifts that array, this patch silently rewrites the WRONG behavior: the scenario Player_body_temperature_uses_our_behavior is what catches it. JsonPatch has no comment field, but ModJsonPatchLoader deserializes with default Newtonsoft settings, so an unknown key is ignored.",
+    "op": "replace",
+    "path": "/client/behaviors/8/code",
+    "value": "caminusbodytemperature",
+    "file": "game:entities/humanoid/player.json"
+  },
+  {
+    "comment": "Same entry on the server list (line 4305, index 10). The domain on 'file' is not optional here: JsonUtil.ToObject adds an AssetLocationJsonParser bound to the patch file's own domain when it is not 'game' (JsonUtil.cs:95), so a bare path would resolve to caminus:entities/humanoid/player.json and the patch would be logged as a missing file.",
+    "op": "replace",
+    "path": "/server/behaviors/10/code",
+    "value": "caminusbodytemperature",
+    "file": "game:entities/humanoid/player.json"
+  }
+]

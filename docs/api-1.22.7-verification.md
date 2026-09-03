@@ -84,6 +84,8 @@ Torches and kettles are not sources. Discovery via `Block.GetInterface<T>(world,
 `ClassRegistry.RegisterentityBehavior` (lib, l.442) uses `Dictionary.Add`: impossible to re-register
 `"bodytemperature"` with a different type. Clean route: JSON patch of `game:entities/humanoid/player.json`
 (lines 326 and 4305) to swap the behavior's code for ours, a subclass with `OnGameTick` rewritten.
+Done in milestone 3; the exact paths, the patch loader's rules and the two balance quirks are in
+section 13.
 
 ## 4. Spoilage
 
@@ -275,6 +277,100 @@ Lava and boiling water carry `BlockBehaviorHeatSource` in their JSON (`survival/
 `heatStrength: 12`, `boilingwater.json` 3), and `Block.GetInterface<IHeatSource>` finds a block behavior
 (Block.cs:2722). Liquids live in the fluid layer, but `GetBlock(pos)` with the default layer falls back
 to it when the solid layer is empty, so a lava block is found without asking for `BlockLayersAccess.Fluid`.
+
+## 13. Swapping the body temperature behavior (verified 2026-09-03)
+
+### The entity file and the exact indices
+
+`game:entities/humanoid/player.json` lives in `assets/game/entities/humanoid/player.json`, not in
+`survival/`, and it is relaxed JSON: unquoted keys, `//` comments, trailing commas. Its two behavior
+lists both carry the entry:
+
+| Side | Path in the file | JsonPatch path | Line in 1.22.7 |
+|---|---|---|---|
+| Client | `client.behaviors[8]` | `/client/behaviors/8/code` | 326 |
+| Server | `server.behaviors[10]` | `/server/behaviors/10/code` | 4305 |
+
+Client list (13 entries): repulseagents, nametag, playerphysics, interpolateposition, playerrevivable,
+aimingaccuracy, tiredness, extraskinnable, **bodytemperature**, breathe, drunktyping, idleanimations,
+playerinventory.
+Server list (15 entries): repulseagents, nametag, playerphysics, collectitems, health, hunger,
+breathe, playerrevivable, aimingaccuracy, tiredness, **bodytemperature**, extraskinnable,
+idleanimations, playerinventory, entitystatetags.
+
+An index path is not a shortcut: `JsonPatch` (VSEssentials, `Vintagestory.ServerMods.NoObf`) has
+`Op`, `File`, `FromPath`, `Path`, `DependsOn`, `Enabled`, `Side`, `Condition`, `Value` and no way to
+address an array element by value. Vanilla patches this very file the same way
+(`survival/patches/playerhealthpoints.json` writes `/server/behaviors/4/currenthealth`, index 4 =
+`health`, which matches the list above). A mod that inserts a behavior before index 8 or 10 would
+make our patch rewrite the wrong entry, hence the scenario that checks the entity type.
+
+### Patch mechanics confirmed in the source
+
+- **A `comment` key is safe.** `ModJsonPatchLoader.ApplyPatches` (l.66) reads the file with
+  `asset.ToObject<JsonPatch[]>()` and no `JsonSerializerSettings`, so Newtonsoft's default
+  `MissingMemberHandling.Ignore` applies: unknown keys are dropped silently.
+- **The domain on `file` is mandatory for us.** `JsonUtil.ToObject` (JsonUtil.cs:95) registers an
+  `AssetLocationJsonParser` bound to the asset's own domain whenever that domain is not `game`. Our
+  patch lives in `caminus`, so a bare `"entities/humanoid/player.json"` would resolve to
+  `caminus:entities/...` and be logged as a missing file. Vanilla patches get away with the bare
+  path only because they are in the `game`/`survival` domains.
+- **`Side` defaults to Universal** (field initializer on `JsonPatch.Side`), so one patch file covers
+  the dedicated server and the client; a client patching `/server/...` is harmless and vice versa.
+- **`op: replace` on a leaf** is a `Tavis` `ReplaceOperation` and throws `PathNotFoundException` if
+  the path is wrong, which the loader counts as an error in the startup line.
+- The loader's summary line is
+  `JsonPatch Loader: N patches total, successfully applied N patches, ..., no errors`. Measured on a
+  real dedicated server: **14 patches without Caminus, 16 with, both fully applied, no errors.**
+
+### The behavior itself
+
+`updateBodyTemperature` is `protected` but **not virtual**, and `tempTree`, `api`, `blockAccess`,
+`accum`, `slowaccum`, `veryslowaccum`, `plrpos`, `tmpPos`, `inEnclosedRoom`, `tempChange`,
+`clothingBonus`, `damagingFreezeHours`, `sprinterCounter`, `lastWearableHoursTotalUpdate`,
+`bodyTemperatureResistance`, `firstTick` and `lastMoveMs` are all private, as are
+`getNearHeatSourceStrength`, `updateFreezingAnimState` and `updateWearableConditions`. Only
+`nearHeatSourceStrength` (protected), `NormalBodyTemperature`, `CurBodyTemperature`, `Wetness`,
+`LastWetnessUpdateTotalHours` and `BodyTempUpdateTotalHours` are reachable. So the subclass overrides
+`OnGameTick` and re-implements the whole update; `src/Caminus/BodyTemperature.cs` cites the vanilla
+line number on every block.
+
+Two quirks worth knowing before touching the balance:
+
+- **Resistance is only read on the second life of an entity.** `Initialize` (l.131-143) creates the
+  `bodyTemp` tree on the `if` branch and reads `world.Config["bodyTemperatureResistance"]` on the
+  `else` branch only. A brand new player therefore runs its first session with a resistance of 0.
+  Ported as is.
+- **The comfort term is not centred on 20 °C.** With the default resistance of 0,
+  `num5 = T - clamp(T, 0, 50)` is 0 for any T in 0..50, and the `if (num5 == 0)` fallback then sets
+  `num5 = max(T - resistance, 0)`. So 0 °C is the neutral point, anything warmer *heats* the player
+  (20 °C gives +3.3 °C/h, doubled to +6.7 by the `tempChange > 0.5` rule) and only air below 0 °C
+  cools. Add to that vanilla's dead band: a `tempChange` between -0.5 and 0 changes nothing at all,
+  so the air has to be under about -3 °C before an unclothed player starts losing heat. The
+  milestone brief assumed 20 °C was neutral; the code follows vanilla, not the brief.
+
+Caminus changes exactly one line of the port, vanilla l.266:
+
+```csharp
+// vanilla
+tempChange = nearHeatSourceStrength + (inEnclosedRoom ? 1f : -wind + num6);
+// Caminus
+tempChange = nearHeatSourceStrength + num6 - (inEnclosedRoom || tracked ? 0f : wind);
+```
+
+with `num6` computed on `RoomThermalSystem.TryGetLocalTemperature(EyeBlockPos(entity))` when that
+succeeds and on `GetClimateAt(plrpos).Temperature` otherwise. Rain, wetness, drying, sprint,
+clothing, sleeping, the on-fire override, the freeze damage and the radiant scan are untouched.
+`RoomThermalSystem` is a server-only mod system, so `GetModSystem<RoomThermalSystem>()` returns null
+on the client and the client half falls back to the climate; it does not matter, since the update
+only runs server side anyway.
+
+### Testing it
+
+A test player joins in **creative**, and vanilla returns early for creative and spectator players
+after pinning the body at `NormalBodyTemperature` (l.228). Any body temperature scenario has to run
+`/gamemode <name> survival` first. The embedded server also accepts 16 clients with no queue and test
+players never leave, so scenarios that join extra players have to `IServerPlayer.Disconnect()` them.
 
 ## Names cited from memory vs. reality
 

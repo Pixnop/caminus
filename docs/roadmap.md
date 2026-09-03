@@ -19,17 +19,22 @@ testable. Target: 1.22.7, precompiled mod (Harmony isn't accessible to source mo
 
 ## Status and reordering (2026-09-03)
 
-Milestones 0, 1 and 2 are on `main` with Atlas scenarios. After the first in-game test the order
-changed:
+Milestones 0, 1, 2, 2b, 5 and 3 are on `main` with Atlas scenarios (20 engine tests, 16 scenarios).
+After the first in-game test the order changed:
 
-- **Milestone 2b, in progress**: wind (speed, direction, windward faces and openings leak more),
+- **Milestone 2b, done**: wind (speed, direction, windward faces and openings leak more),
   analytic vertical stratification (the ceiling is warmer than the floor and loses more), and
   rooms that keep living without a player (tracked while their chunk is loaded, discovered by
   their own containers).
-- **Milestone 5 (overlay) moves right after 2b**: block highlights coloured by heat flow, particles
-  drifting along the flow, small HUD, toggled by a hotkey. It is the visual check for everything
-  above.
-- Then milestone 3 (player body temperature), then milestone 4 (chimney draft).
+- **Milestone 5 (overlay) moved right after 2b, done**: block highlights coloured by heat flow,
+  particles drifting along the flow, small HUD, toggled by a hotkey. It is the visual check for
+  everything above.
+- **Milestone 3, done (2026-09-03)**: `EntityBehaviorCaminusBodyTemperature` subclasses the vanilla
+  behavior and is swapped in by a JSON patch of `game:entities/humanoid/player.json`. The whole
+  vanilla update is ported line by line; the flat +1 °C per hour every enclosed room used to grant
+  is gone, and the room node's air at the player's eye height feeds the same comfort term vanilla
+  applies outdoors. Details and what was verified: `api-1.22.7-verification.md` section 13.
+- Next: milestone 4 (chimney draft), then milestone 6.
 
 ## Milestone 0: skeleton (1 to 2 days)
 
@@ -73,17 +78,22 @@ Testable: unit tests for Kusuda (damping and phase shift by depth), for offline 
 (extrapolating 1000 steps = integrating 1000 steps, within tolerance). In-game: a cellar 3 blocks
 deep vs. 10 blocks deep in summer and winter, two baskets of meat side by side inside and outside.
 
-## Milestone 3: the player gets cold (1 week)
+## Milestone 3: the player gets cold (done, 2026-09-03)
 
-- `caminus:bodytemperature` behavior (subclass, JSON patch of `player.json`): air temperature =
-  the node's, plus a radiant term from the firepit (distance, line of sight in the room), plus clo
-  from existing clothing, wind only outside a room. No more flat +1/h in an enclosed room.
-- Simple single-node model first (the game's, but with a real air temperature); Fanger and
-  Gagge stay in reserve.
+- `caminusbodytemperature` behavior (subclass of `EntityBehaviorBodyTemperature`, JSON patch of
+  `game:entities/humanoid/player.json`): air temperature = the room node's at eye height, plus
+  vanilla's own radiant scan of the room bbox, plus clo from existing clothing, wind only outside a
+  room. No more flat +1/h in an enclosed room.
+- Simple single-node model (the game's, but with a real air temperature); Fanger and Gagge stay in
+  reserve.
 
-Testable: unit test on the balance (a room at 5 °C with no fire cools the player, a firepit 2 blocks
-away warms them). In-game: winter, a fireless cabin means freezing; light it and warm back up.
-Compatibility to check with Immersive Body Temperature and RealisticTemperatures (same behavior targeted).
+Tested: Atlas scenarios `Player_body_temperature_uses_our_behavior` (the entity carries exactly one
+body temperature behavior and it is ours; the air the body reads is the room's eye-height value, not
+the climate) and `Unheated_cold_room_cools_the_player` (a room forced to -25 °C drains the player
+while an identical room in the normal climate does not). In-game: winter, a fireless cabin means
+freezing; light it and warm back up.
+Compatibility still to check with Immersive Body Temperature and RealisticTemperatures: they target
+the same behavior entry, and whichever patch runs last wins the `code` field.
 
 ## Milestone 4: the chimney (2 weeks, the heart of the gameplay)
 

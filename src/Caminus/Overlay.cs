@@ -83,7 +83,8 @@ public class OverlayServer : ModSystem
             (List<BlockPos> blocks, List<int> colors) = Highlights(flows);
             sapi.World.HighlightBlocks(player, Slot, blocks, colors);
             SpawnFlowParticles(flows);
-            channel.SendPacket(new OverlayPacket { Text = Describe(flows, pos.Y) }, player);
+            double? body = player.Entity.GetBehavior<EntityBehaviorCaminusBodyTemperature>()?.CurBodyTemperature;
+            channel.SendPacket(new OverlayPacket { Text = Describe(flows, pos.Y, body) }, player);
         }
     }
 
@@ -167,7 +168,8 @@ public class OverlayServer : ModSystem
     /// The three HUD lines. <paramref name="eyeY"/> is the block the player is looking out of.
     /// Public and pure, same reason as <see cref="Highlights"/>.
     /// </summary>
-    public static string Describe(RoomFlows flows, int eyeY)
+    /// <param name="body">Player's body temperature, when the caller has one to show.</param>
+    public static string Describe(RoomFlows flows, int eyeY, double? body = null)
     {
         int floorY = int.MaxValue, ceilingY = int.MinValue;
         double watts = 0;
@@ -190,6 +192,7 @@ public class OverlayServer : ModSystem
         // Faces count heat leaving as positive; the player reads a room that loses heat as negative.
         sb.Append(c, $"Floor {Local(flows, floorY):0.0} °C   eyes {Local(flows, eyeY):0.0} °C   " +
                      $"ceiling {Local(flows, ceilingY):0.0} °C   net {-watts:0} W");
+        if (body != null) sb.Append(c, $"   body {body:0.0} °C");
         return sb.ToString();
     }
 

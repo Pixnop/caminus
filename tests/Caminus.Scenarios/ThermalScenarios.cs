@@ -66,6 +66,15 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [GeneratedRegex(@"ceiling (-?\d+(?:\.\d+)?) °C")]
     private static partial Regex CeilingTemp();
 
+    [GeneratedRegex(@"eyes (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex EyesTemp();
+
+    [GeneratedRegex(@"Body: (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex BodyTemp();
+
+    [GeneratedRegex(@"\(air (-?\d+(?:\.\d+)?) °C")]
+    private static partial Regex BodyAir();
+
     /// <summary>BlockEntityContainer.container is protected: the only way to ask a real chest for its rate.</summary>
     private static readonly FieldInfo ContainerField =
         typeof(BlockEntityContainer).GetField("container", BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -85,8 +94,9 @@ public partial class ThermalScenarios : AtlasScenarioBase
         LightFirepit(inside.Offset(0, -1, 0));
         await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
 
-        string before = await WaitForRoomReport(inside);
-        Assert.Contains("Sources: 4000 W", before); // lit firepit = 10 units × 400 W
+        // Waiting on the source line, not just on the room: the room can already be tracked from an
+        // earlier tick and answer instantly with the scan that ran before the firepit was placed.
+        string before = await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W")); // 10 units × 400 W
 
         // The mod's step is in GAME seconds (realDt × SpeedOfTime × CalendarSpeedMul).
         // GameCalendar.CalculateCurrentTimeSpeed SUMS the modifiers (it does not multiply
@@ -565,5 +575,160 @@ public partial class ThermalScenarios : AtlasScenarioBase
         Match m = what.Match(report);
         Assert.True(m.Success, $"'{what}' not found in:\n{report}");
         return double.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
+    }
+
+    // --- Milestone 3: body temperature -------------------------------------------------------
+
+    /// <summary>
+    /// The JSON patch swapped the behavior on the entity, and the player reads the room's own air
+    /// rather than the climate. A firepit is what separates the two: an unheated room settles on
+    /// the outside temperature and the assertion would prove nothing.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Player_body_temperature_uses_our_behavior()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusBody", 640, Stone);
+        try
+        {
+            await Survival("CaminusBody");
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+
+            // Two body temperature behaviors on one entity would fight over the same bodyTemp tree, so
+            // the patch has to REPLACE the vanilla entry, not add ours next to it.
+            EntityBehaviorBodyTemperature? behavior = player.Entity.GetBehavior<EntityBehaviorBodyTemperature>();
+            Assert.IsType<EntityBehaviorCaminusBodyTemperature>(behavior);
+            Assert.Equal(1, player.Entity.SidedProperties.Behaviors.Count(b => b is EntityBehaviorBodyTemperature));
+
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
+
+            var ours = (EntityBehaviorCaminusBodyTemperature)behavior!;
+            string report = await WaitForRoomReport(inside, r => Read(RoomTemp(), r) > Read(OutsideTemp(), r) + 5);
+            double outside = Read(OutsideTemp(), report);
+            string line = "";
+            for (int i = 0; i < 40 && !(BodyAir().IsMatch(line) && Read(BodyAir(), line) > outside + 5); i++)
+            {
+                await World.Ticks(30);
+                line = ours.Describe();
+            }
+            Assert.True(BodyAir().IsMatch(line) && Read(BodyAir(), line) > outside + 5,
+                $"the body never saw the warm room air (outside {outside:0.0} °C)\n{line}\n{await ReportAt(inside)}");
+
+            // The air the body sees is the room node at eye height, not the climate outside. The two are
+            // read a moment apart while the room is still warming, hence the 2 K window.
+            report = await ReportAt(inside);
+            Assert.True(Math.Abs(Read(EyesTemp(), report) - Read(BodyAir(), line)) < 2.0,
+                $"the body reads {Read(BodyAir(), line):0.0} °C, the room says {Read(EyesTemp(), report):0.0} °C\n{report}\n{line}");
+            Assert.Contains("radiant", line);
+            Assert.InRange(Read(BodyTemp(), line), 31, 45);
+
+            // Same line through the command, this time with a player as the caller.
+            string full = PlayerReport(player, "/caminus temp");
+            Assert.Contains("Room:", full);
+            Assert.Contains("Body:", full);
+
+            // And through the overlay HUD, where it is a suffix on the third line.
+            Assert.True(World.Api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetFaceFlows(inside, out RoomFlows? flows), report);
+            Assert.EndsWith(" °C", OverlayServer.Describe(flows!, inside.Y, ours.CurBodyTemperature));
+            Assert.Contains("body ", OverlayServer.Describe(flows!, inside.Y, ours.CurBodyTemperature));
+        }
+        finally { await Leave(player); }
+    }
+
+    /// <summary>
+    /// Vanilla gives a flat +1 °C per hour in ANY enclosed room, whatever the weather. With that
+    /// gone, a room whose air is below the <c>bodyTemperatureResistance</c> world config (default
+    /// 0 °C) has to cool the player, while an identical room in the normal climate must not.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Unheated_cold_room_cools_the_player()
+    {
+        (ITestPlayer control, BlockPos mild) = await RoomAndPlayer("CaminusBodyMild", 720, Stone);
+        (ITestPlayer chilled, BlockPos cold) = await RoomAndPlayer("CaminusBodyCold", 780, Stone);
+        await Survival("CaminusBodyMild");
+        await Survival("CaminusBodyCold");
+        SetWindPattern("still"); // another scenario may have left a storm blowing warm air in
+        await WaitForRoomReport(mild);
+        string before = await WaitForRoomReport(cold);
+
+        // Atlas's superflat world has one climate map and no season worth overriding
+        // (SetSeasonOverride moves the worldgen season, not this flat map), and the comfort term
+        // only starts cooling below bodyTemperatureResistance. So the cold room is made cold at the
+        // source: OnGetClimate is the engine's own hook for the instantaneous temperature, the same
+        // one ModTemperature uses, and Caminus reads the outside air through GetClimateAt every
+        // tick. The X slice keeps every other room of this class on its own weather.
+        int gate = World.Spawn.X + 760;
+        void Freeze(ref Vintagestory.API.Common.ClimateCondition climate, BlockPos pos, Vintagestory.API.Common.EnumGetClimateMode mode, double totalDays)
+        {
+            if (climate != null && pos.X >= gate) climate.Temperature = -25f;
+        }
+
+        World.Api.Event.OnGetClimate += Freeze;
+        try
+        {
+            var mildBody = Assert.IsType<EntityBehaviorCaminusBodyTemperature>(control.Entity.GetBehavior<EntityBehaviorBodyTemperature>());
+            var coldBody = Assert.IsType<EntityBehaviorCaminusBodyTemperature>(chilled.Entity.GetBehavior<EntityBehaviorBodyTemperature>());
+            float mildStart = mildBody.CurBodyTemperature, coldStart = coldBody.CurBodyTemperature;
+
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            // The stone box has a time constant of about 1000 game seconds and x10 time buys 300 of
+            // them per real second, so 900 ticks is roughly nine of them: the room really reaches
+            // the forced -25 °C instead of drifting halfway there.
+            await World.Ticks(900);
+
+            string after = await ReportAt(cold);
+            Assert.True(Read(RoomTemp(), after) < -10,
+                $"the forced climate never reached the room\nbefore:\n{before}\nafter:\n{after}");
+
+            double coldDrop = coldStart - coldBody.CurBodyTemperature;
+            double mildDrop = mildStart - mildBody.CurBodyTemperature;
+            Assert.True(coldDrop > 2.0,
+                $"the player only lost {coldDrop:0.00} K in a room at {Read(RoomTemp(), after):0.0} °C\n{after}\n{coldBody.Describe()}");
+            Assert.True(coldDrop > mildDrop + 2.0,
+                $"cold room {coldDrop:0.00} K vs control {mildDrop:0.00} K\ncold: {coldBody.Describe()}\ncontrol: {mildBody.Describe()}");
+        }
+        finally
+        {
+            World.Api.Event.OnGetClimate -= Freeze;
+            await Leave(control);
+            await Leave(chilled);
+        }
+    }
+
+    /// <summary>
+    /// Frees the client slot. The embedded server accepts 16 clients and no queue, test players
+    /// never leave on their own, and this class is already close to the cap: the three players the
+    /// body temperature scenarios need have to hand their seats back.
+    /// </summary>
+    private async Task Leave(ITestPlayer player)
+    {
+        ((Vintagestory.API.Server.IServerPlayer)player.Player).Disconnect("scenario over");
+        await World.Until(() => !player.IsConnected, 600);
+    }
+
+    /// <summary>
+    /// Atlas players join in creative, and vanilla pins a creative player's body temperature at
+    /// 37 °C and returns before anything else runs (l.228).
+    /// </summary>
+    private async Task Survival(string playerName)
+    {
+        CommandResult result = await World.ExecuteCommand($"/gamemode {playerName} survival");
+        Assert.True(result.Ok, result.Message);
+    }
+
+    /// <summary>
+    /// Runs a command with a player as the caller. Atlas's own ExecuteCommand always runs as the
+    /// console, and the Body line only exists when the caller has an entity.
+    /// </summary>
+    private string PlayerReport(ITestPlayer player, string command)
+    {
+        string message = "";
+        World.Api.ChatCommands.ExecuteUnparsed(command, new Vintagestory.API.Common.TextCommandCallingArgs
+        {
+            LanguageCode = "en",
+            Caller = new Vintagestory.API.Common.Caller { Player = player.Player, CallerPrivileges = ["*"] }
+        }, result => message = result.StatusMessage ?? "");
+        return message;
     }
 }

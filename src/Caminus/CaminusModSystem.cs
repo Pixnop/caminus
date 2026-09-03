@@ -9,6 +9,10 @@ public class CaminusModSystem : ModSystem
     public override void Start(ICoreAPI api)
     {
         api.Logger.Notification("Caminus {0} loaded ({1})", Mod.Info.Version, api.Side);
+        // Both sides, like SurvivalCoreSystem registers the vanilla one (SurvivalCoreSystem.cs:865):
+        // the client half of the behavior drives the frost shader. The entity picks it up through
+        // assets/caminus/patches/player-bodytemperature.json.
+        api.RegisterEntityBehaviorClass("caminusbodytemperature", typeof(EntityBehaviorCaminusBodyTemperature));
     }
 
     public override void StartServerSide(ICoreServerAPI api)
@@ -27,9 +31,10 @@ public class CaminusModSystem : ModSystem
                 {
                     BlockPos? pos = (args[0] as Vec3d)?.AsBlockPos ?? (args.Caller.Entity == null ? null : RoomThermalSystem.EyeBlockPos(args.Caller.Entity));
                     if (pos == null) return TextCommandResult.Error("Position required from the console: /caminus temp x y z");
-                    return api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetReport(pos, out string report)
-                        ? TextCommandResult.Success(report)
-                        : TextCommandResult.Success("No enclosed room here.");
+                    string body = args.Caller.Entity?.GetBehavior<EntityBehaviorCaminusBodyTemperature>()?.Describe() ?? "";
+                    if (!api.ModLoader.GetModSystem<RoomThermalSystem>().TryGetReport(pos, out string report))
+                        return TextCommandResult.Success(body.Length == 0 ? "No enclosed room here." : "No enclosed room here.\n" + body);
+                    return TextCommandResult.Success(body.Length == 0 ? report : report + "\n" + body);
                 })
             .EndSubCommand();
     }
