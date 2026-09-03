@@ -17,6 +17,20 @@ testable. Target: 1.22.7, precompiled mod (Harmony isn't accessible to source mo
    before the unload, chunks are still readable). Deep ground node per server region.
 5. Don't break greenhouses: vanilla criterion `SkylightCount > NonSkylightCount && ExitCount == 0`.
 
+## Status and reordering (2026-09-03)
+
+Milestones 0, 1 and 2 are on `main` with Atlas scenarios. After the first in-game test the order
+changed:
+
+- **Milestone 2b, in progress**: wind (speed, direction, windward faces and openings leak more),
+  analytic vertical stratification (the ceiling is warmer than the floor and loses more), and
+  rooms that keep living without a player (tracked while their chunk is loaded, discovered by
+  their own containers).
+- **Milestone 5 (overlay) moves right after 2b**: block highlights coloured by heat flow, particles
+  drifting along the flow, small HUD, toggled by a hotkey. It is the visual check for everything
+  above.
+- Then milestone 3 (player body temperature), then milestone 4 (chimney draft).
+
 ## Milestone 0: skeleton (1 to 2 days)
 
 Contents: repo, `Caminus.csproj` net10.0 referencing the 1.22.7 dlls, `modinfo.json` (`caminus`),

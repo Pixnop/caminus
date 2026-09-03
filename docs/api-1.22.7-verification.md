@@ -206,6 +206,45 @@ point, injectable via JSON patch. Consumed directly by the vanilla flood-fill.
 covered (`GetRainMapHeightAt > Y`). Effect: `+5 °C` on growth climate. `IsSmallRoom` doesn't factor in.
 Same criterion in `BlockEntityBerryBush` and `BlockEntityBeehive`. Must not be broken.
 
+## 11. Wind
+
+`IBlockAccessor.GetWindSpeedAt(BlockPos)` / `(Vec3d)` (IBlockAccessor.cs:559-566). Server side it lands
+on `ServerWorldMap.GetWindSpeedAt` (l.598), which starts from a zero `Vec3d` and fires
+`EventManager.TriggerOnGetWindSpeed`; the `BlockPos` overload just forwards `new Vec3d(pos.X, pos.Y, pos.Z)`,
+so the dimension is dropped. Never returns null.
+
+The only vanilla subscriber is `WeatherSystemBase.Event_OnGetWindSpeed` (l.62):
+
+```csharp
+windSpeed.X = WeatherDataSlowAccess.GetWindSpeed(pos);
+```
+
+**The wind is one signed number on the X axis.** Y and Z stay zero, so vanilla wind always blows east
+(positive) or west (negative), and `wind · n` is zero on every north/south face. `ModSystemDevastationEffects`
+is the only other subscriber and only inside the devastation area.
+
+Value: `WeatherSimulationRegion.GetWindSpeed(posY)` (l.351) = the current wind pattern's `Strength`,
+then `× max(1, 0.9 + (y − seaLevel) / 100)` capped at **1.5** above sea level, or `/ (1 + (seaLevel − y) / 4)`
+below it. Pattern strengths (`assets/game/config/windpatterns/`): still 0 ± 0.05, lightbreeze 0.15,
+mediumbreeze 0.3, strongbreeze 0.6, storm 1.0 ± 0.1, each (except still) plus a simplex noise term of 0 to 1.
+So the usable range is 0 to about 1.5, and 0.15 is the threshold vanilla itself treats as "windy"
+(`EntityBehaviorBodyTemperature`, l.266: `max((wind.Length() − 0.15) × 2, 0)` cools an entity, but only
+outside a room, since an enclosed room takes a flat +1/h instead).
+
+**There is no indoor damping**: the value depends on the position's height and its map region, not on
+whether there are walls around it. `WeatherDataReaderBase.pgetWindSpeed` bilinearly blends the four map
+region sims around the position, and a region that is not loaded contributes `ws.dummySim`.
+
+Caminus reads the wind two blocks above the roof and samples the incoming air's climate up to 64
+blocks upwind, at `max(upwind terrain height + 1, room centre Y)`: `GetClimateAt` cools with
+altitude, so sampling at ground level would give a building perched in the air a warm wind that has
+nothing to do with the air around it, while terrain higher than the room does mean the air came over
+it.
+
+Driving it from a test or a command: `/weather setw <pattern>` (`WeatherSystemCommands`, l.128, requires
+a player) or, in process, `WeatherSystemBase.weatherSimByMapRegion` (public field) and
+`WeatherSimulationRegion.SetWindPattern(code, updateInstant)` (public), plus `dummySim`.
+
 ## Names cited from memory vs. reality
 
 | Cited | Real |

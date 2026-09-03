@@ -3,8 +3,12 @@
   "wattsPerHeatStrength": 400,
   "airCapacityFactor": 5,
   "openingConductance": 30,
-  "roomForgetSeconds": 300,
   "groundContactU": 1.0,
+  "windWallFactor": 2.0,
+  "windOpeningFactor": 4.0,
+  "windSampleDistance": 64,
+  "stratificationKPerMPerKW": 0.4,
+  "stratificationMaxKPerM": 2.0,
   "wallU": {
     "Stone": 3.0,
     "Brick": 2.5,

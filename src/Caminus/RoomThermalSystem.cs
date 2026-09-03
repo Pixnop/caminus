@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
 using Caminus.Core;
@@ -23,31 +24,58 @@ public class ThermalConfig
     public double OpeningConductance { get; set; } = 30;
     /// <summary>W/K per m² of wall face buried below the world-generated surface, whatever the material.</summary>
     public double GroundContactU { get; set; } = 1.0;
-    public double RoomForgetSeconds { get; set; } = 300;
+    /// <summary>Extra wall conductance per unit of wind blowing straight at the face (0 = wind ignored).</summary>
+    public double WindWallFactor { get; set; } = 2.0;
+    /// <summary>Same for an opening, which leaks with any wind, not only a head-on one.</summary>
+    public double WindOpeningFactor { get; set; } = 4.0;
+    /// <summary>Blocks upwind where the incoming air's temperature is sampled, at full wind.</summary>
+    public double WindSampleDistance { get; set; } = 64;
+    public double StratificationKPerMPerKW { get; set; } = 0.4;
+    public double StratificationMaxKPerM { get; set; } = 2.0;
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
 
     public double UFor(EnumBlockMaterial mat) => WallU.TryGetValue(mat, out double u) ? u : 3.0;
 }
 
+/// <summary>One square metre of the room's envelope.</summary>
+/// <param name="Pos">The wall block, outside the room.</param>
+/// <param name="Facing">From the room toward the wall, so <c>Facing.Normali</c> is the outward normal.</param>
+/// <param name="UA">Conductance of the face in calm air, W/K.</param>
+/// <param name="Y">Height of the room-side air block, the air actually touching the face: same as
+/// <paramref name="Pos"/>.Y except for the floor and ceiling faces.</param>
+public readonly record struct Face(BlockPos Pos, BlockFacing Facing, EnumBlockMaterial Material, double UA, bool Ground, bool Opening, int Y);
+
+/// <summary>A face with what it is doing right now. Positive <paramref name="Watts"/> = heat leaving the room.</summary>
+public readonly record struct FaceFlow(Face Face, double Conductance, double Watts);
+
+/// <summary>Everything a client overlay needs to draw one room. GroundTemperature is NaN if the room touches no ground.</summary>
+public sealed record RoomFlows(
+    double Temperature, double OutsideTemperature, double GroundTemperature, double WindTemperature,
+    Vec3d Wind, double Gradient, double YMid, double StratificationWatts, IReadOnlyList<FaceFlow> Faces);
+
 /// <summary>
 /// Thermal simulation of the rooms players are in. Server side only: RoomRegistry
 /// is not thread-safe, everything runs on the main thread.
+/// Each room owns its own <see cref="ThermalNetwork"/> of at most four nodes, so a tick costs
+/// O(1) per room and a base with fifty of them is fifty tiny solves, not one 200x200 matrix.
 /// </summary>
 public class RoomThermalSystem : ModSystem
 {
     private const double AirVolumetricCapacity = 1.2 * 1005; // J/K per m³ of air
     private const string ModDataKey = "caminus:rooms";
+    /// <summary>How long a position that is not in a room is trusted not to have become one, in game hours.</summary>
+    private const double NoRoomTtlHours = 60.0 / 3600;
+    /// <summary>Ticks between two heat-source scans of a room nobody is standing in.</summary>
+    private const int UnoccupiedSourceScanTicks = 10;
 
     private sealed class Geometry
     {
         public int Volume;
-        public int Openings;
-        /// <summary>Faces toward the open air, by material.</summary>
-        public readonly Dictionary<EnumBlockMaterial, (int Faces, double WPerK)> Walls = [];
-        /// <summary>Faces buried below the world-generated surface, by material.</summary>
-        public readonly Dictionary<EnumBlockMaterial, (int Faces, double WPerK)> GroundWalls = [];
+        /// <summary>Every face of the envelope, flat: walls, openings and buried faces alike.</summary>
+        public readonly List<Face> Faces = [];
         public int GroundFaces;
         public int GroundDepthSum;
+        /// <summary>Calm-air conductance toward the outside air, W/K.</summary>
         public double Conductance;
         public double GroundConductance;
 
@@ -63,15 +91,29 @@ public class RoomThermalSystem : ModSystem
         public double OutsideTemperature;
         public double GroundTemp;
         public double SourceWatts;
-        public long LastSeenMs;
+        /// <summary>Wind above the roof, game units. Vanilla only ever fills X (see <see cref="WindAt"/>).</summary>
+        public Vec3d Wind = new();
+        /// <summary>Temperature of the air the wind brings in, sampled upwind.</summary>
+        public double WindTemperature;
+        /// <summary>Extra envelope conductance caused by the wind, W/K, toward <see cref="WindTemperature"/>.</summary>
+        public double WindConductance;
+        public double Gradient;
+        /// <summary>Power the vertical gradient costs the room, W (negative: the ceiling loses more than the floor gains).</summary>
+        public double StratificationWatts;
+        public bool HasPlayer;
+        public long Ticks;
         /// <summary>Game hours at the last simulated step: the base for offline relaxation.</summary>
         public double TotalHours;
         public int Dimension;
         /// <summary>Surface climate at this room, sampled once (annual mean, half-swing, coldest day).</summary>
         public (double Mean, double Amplitude, double ColdestDay)? Climate;
+        /// <summary>This room alone: room node, outside, wind, and the ground when it touches any.</summary>
+        public ThermalNetwork Net = null!;
         public int Node = -1;
         public int OutsideNode = -1;
         public int Edge = -1;
+        public int WindNode = -1;
+        public int WindEdge = -1;
         public int GroundNode = -1;
         public int GroundEdge = -1;
     }
@@ -83,9 +125,9 @@ public class RoomThermalSystem : ModSystem
     private RoomRegistry rooms = null!;
     private ThermalConfig config = null!;
     private readonly Dictionary<string, RoomEntry> entries = [];
-    private ThermalNetwork? network;
+    /// <summary>Chunks where a container asked for a room and there was none, with the game hour it expires.</summary>
+    private readonly Dictionary<(int X, int Y, int Z), double> noRoom = [];
     private Harmony? harmony;
-    private bool dirty;
 
     public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Server;
 
@@ -121,40 +163,39 @@ public class RoomThermalSystem : ModSystem
     private void OnTick(float dtRealSeconds)
     {
         if (dtRealSeconds <= 0) return;
-        long nowMs = sapi.World.ElapsedMilliseconds;
-        TrackPlayerRooms(nowMs);
-        ForgetStaleRooms(nowMs);
-        if (entries.Count == 0) { network = null; dirty = false; return; }
-
-        foreach (RoomEntry e in entries.Values)
-        {
-            e.OutsideTemperature = OutsideTemperature(e);
-            e.GroundTemp = GroundTemperatureOf(e);
-            e.SourceWatts = SourceWatts(e.Room, e.Dimension);
-        }
-
-        if (dirty || network == null) Rebuild();
-
-        foreach (RoomEntry e in entries.Values)
-        {
-            network!.SetTemperature(e.OutsideNode, e.OutsideTemperature);
-            network.SetSourcePower(e.Node, e.SourceWatts);
-            network.SetEdgeConductance(e.Edge, e.Geom.Conductance);
-            if (e.GroundNode < 0) continue;
-            network.SetTemperature(e.GroundNode, e.GroundTemp);
-            network.SetEdgeConductance(e.GroundEdge, e.Geom.GroundConductance);
-        }
+        TrackPlayerRooms();
+        // A room is kept as long as its chunk column is loaded, player or not: a cellar has to keep
+        // cooling while nobody watches, and OnChunkColumnUnloaded is what ends its life.
 
         // The step is in GAME seconds: a building's heat evolves on the scale of game days,
         // not real-world minutes. SpeedOfTime × CalendarSpeedMul = 60 × 0.5 by default,
         // i.e. 30 game seconds per real second (GameCalendar.cs:303).
         double dt = dtRealSeconds * sapi.World.Calendar.SpeedOfTime * sapi.World.Calendar.CalendarSpeedMul;
         if (dt <= 0) return;
-        network!.Step(dt);
 
         foreach (RoomEntry e in entries.Values)
         {
-            e.Temperature = network.GetTemperature(e.Node);
+            e.OutsideTemperature = OutsideTemperature(e);
+            e.GroundTemp = GroundTemperatureOf(e);
+            // The 16³ block scan is the expensive part of the tick; an empty room can afford to see
+            // its firepit go out 10 s late.
+            if (e.HasPlayer || e.Ticks % UnoccupiedSourceScanTicks == 0) e.SourceWatts = SourceWatts(e.Room, e.Dimension);
+            e.Ticks++;
+            UpdateWindAndStratification(e);
+
+            e.Net.SetTemperature(e.OutsideNode, e.OutsideTemperature);
+            e.Net.SetSourcePower(e.Node, e.SourceWatts + e.StratificationWatts);
+            e.Net.SetEdgeConductance(e.Edge, e.Geom.Conductance);
+            e.Net.SetTemperature(e.WindNode, e.WindTemperature);
+            e.Net.SetEdgeConductance(e.WindEdge, e.WindConductance);
+            if (e.GroundNode >= 0)
+            {
+                e.Net.SetTemperature(e.GroundNode, e.GroundTemp);
+                e.Net.SetEdgeConductance(e.GroundEdge, e.Geom.GroundConductance);
+            }
+
+            e.Net.Step(dt);
+            e.Temperature = e.Net.GetTemperature(e.Node);
             e.TotalHours = sapi.World.Calendar.TotalHours;
         }
     }
@@ -170,85 +211,88 @@ public class RoomThermalSystem : ModSystem
         return pos;
     }
 
-    private void TrackPlayerRooms(long nowMs)
+    private void TrackPlayerRooms()
     {
+        foreach (RoomEntry e in entries.Values) e.HasPlayer = false;
         foreach (IPlayer player in sapi.World.AllOnlinePlayers)
         {
             if (player is not IServerPlayer { ConnectionState: EnumClientState.Playing } sp || sp.Entity == null) continue;
             BlockPos pos = EyeBlockPos(sp.Entity);
             Room room = rooms.GetRoomForPosition(pos);
-            // ponytail: an open volume (a doorway to the outside, a hall wider than the vanilla
-            // 14-block limit) is treated as outside; milestone 6 brings the homemade flood fill.
-            if (room?.Location == null || room.PosInRoom == null || room.ExitCount > 0) continue;
-            Track(room, pos.dimension, nowMs);
+            if (!Enclosed(room)) continue;
+            RoomEntry? e = Track(room, pos.dimension);
+            if (e != null) e.HasPlayer = true;
         }
     }
 
-    private void ForgetStaleRooms(long nowMs)
-    {
-        foreach (var key in entries.Where(e => (nowMs - e.Value.LastSeenMs) / 1000.0 > config.RoomForgetSeconds).Select(e => e.Key).ToList())
-        {
-            Save(entries[key]);
-            entries.Remove(key);
-            dirty = true;
-        }
-    }
+    // ponytail: an open volume (a doorway to the outside, a hall wider than the vanilla 14-block
+    // limit) is treated as outside; milestone 6 brings the homemade flood fill.
+    private static bool Enclosed([NotNullWhen(true)] Room? room) =>
+        room?.Location != null && room.PosInRoom != null && room.ExitCount == 0;
 
-    private void Track(Room room, int dim, long nowMs)
+    private RoomEntry? Track(Room room, int dim)
     {
         string key = Key(room.Location, dim);
         if (entries.TryGetValue(key, out RoomEntry? e))
         {
-            e.LastSeenMs = nowMs;
             // Same bbox but a different instance: the registry was invalidated by a ChunkDirty, so a
             // block moved. The geometry is rebuilt, the temperature is kept.
-            if (ReferenceEquals(e.Room, room)) return;
+            if (ReferenceEquals(e.Room, room)) return e;
             e.Room = room;
             e.Geom = Measure(room, dim);
-            dirty = true;
-            return;
+            Build(e);
+            return e;
         }
 
         Geometry geom = Measure(room, dim);
-        if (geom.Volume == 0) return;
+        if (geom.Volume == 0) return null;
         double outside = ClimateTemperature(room.Location, dim) ?? 10;
         e = new RoomEntry
         {
             Room = room,
             Geom = geom,
-            LastSeenMs = nowMs,
             Dimension = dim,
             OutsideTemperature = outside,
+            WindTemperature = outside,
             Temperature = outside, // a room we have never seen starts at the outside temperature
             TotalHours = sapi.World.Calendar.TotalHours,
         };
         e.GroundTemp = GroundTemperatureOf(e);
         Restore(key, e);
+        Build(e);
         entries[key] = e;
-        dirty = true;
+        return e;
     }
 
-    private void Rebuild()
+    /// <summary>
+    /// The room's own network, from its current temperature and geometry. Rebuilt when the entry is
+    /// created and whenever a block moved in its envelope.
+    /// </summary>
+    // ponytail: one network per room, because nothing links two rooms yet. Milestone 4 (a vertical
+    // opening between a cellar and the room above) needs an edge between two room nodes: those two
+    // rooms then have to share one network, which is where this splits into groups of rooms.
+    private void Build(RoomEntry e)
     {
         var net = new ThermalNetwork();
-        foreach (RoomEntry e in entries.Values)
+        e.Node = net.AddNode(Capacity(e.Geom), e.Temperature);
+        e.OutsideNode = net.AddFixedNode(e.OutsideTemperature);
+        e.Edge = net.AddEdge(e.Node, e.OutsideNode, e.Geom.Conductance);
+        // The wind blows air in from somewhere else, so it gets its own fixed node at the
+        // temperature it comes from; its edge carries only the extra conductance it causes.
+        e.WindNode = net.AddFixedNode(e.WindTemperature);
+        e.WindEdge = net.AddEdge(e.Node, e.WindNode, e.WindConductance);
+        e.GroundNode = e.GroundEdge = -1;
+        if (e.Geom.GroundFaces > 0)
         {
-            e.Node = net.AddNode(Capacity(e.Geom), e.Temperature);
-            e.OutsideNode = net.AddFixedNode(e.OutsideTemperature);
-            // Batch 1: all losses go outside or into the ground, no room-to-room edge.
-            e.Edge = net.AddEdge(e.Node, e.OutsideNode, e.Geom.Conductance);
-            e.GroundNode = e.GroundEdge = -1;
-            if (e.Geom.GroundFaces == 0) continue;
             e.GroundNode = net.AddFixedNode(e.GroundTemp);
             e.GroundEdge = net.AddEdge(e.Node, e.GroundNode, e.Geom.GroundConductance);
         }
-        network = net;
-        dirty = false;
+        e.Net = net;
     }
 
     private double Capacity(Geometry g) => Math.Max(1, g.Volume * AirVolumetricCapacity * config.AirCapacityFactor);
 
-    /// <summary>Walks the bbox: volume, walls by material, and openings. 1 m² per face.</summary>
+    /// <summary>Walks the bbox: volume and one <see cref="Face"/> per square metre of envelope.</summary>
     // ponytail: O(bbox × 6) with one GetBlock per face, redone only when the room changes.
     private Geometry Measure(Room room, int dim)
     {
@@ -264,8 +308,11 @@ public class RoomThermalSystem : ModSystem
                 for (int z = c.MinZ; z <= c.MaxZ; z++)
                     MeasureAirBlock(geom, room, acc, pos.Set(x, y, z), nb);
 
-        geom.Conductance = geom.Walls.Values.Sum(w => w.WPerK) + geom.Openings * config.OpeningConductance;
-        geom.GroundConductance = geom.GroundWalls.Values.Sum(w => w.WPerK);
+        foreach (Face f in geom.Faces)
+        {
+            if (f.Ground) geom.GroundConductance += f.UA;
+            else geom.Conductance += f.UA;
+        }
         return geom;
     }
 
@@ -276,17 +323,21 @@ public class RoomThermalSystem : ModSystem
         foreach (BlockFacing face in BlockFacing.ALLFACES)
         {
             nb.Set(pos.X + face.Normali.X, pos.Y + face.Normali.Y, pos.Z + face.Normali.Z);
-            if (!room.Contains(nb)) AddFace(geom, acc, nb, face);
+            if (!room.Contains(nb)) AddFace(geom, acc, nb, face, pos.Y);
         }
     }
 
     /// <summary>Face of an air block toward the outside of the room: wall (solid block on the room side) or opening.</summary>
-    private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face)
+    private void AddFace(Geometry geom, IBlockAccessor acc, BlockPos nb, BlockFacing face, int airY)
     {
         Block block = acc.GetBlock(nb);
         // Same criterion as the vanilla RoomRegistry (RoomRegistry.cs:418): a closed door, a glass
         // pane or a chiseled block retains heat even though its faces are not "solid".
-        if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0) { geom.Openings++; return; }
+        if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0)
+        {
+            geom.Faces.Add(new Face(nb.Copy(), face, EnumBlockMaterial.Air, config.OpeningConductance, false, true, airY));
+            return;
+        }
         EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
 
         // GetTerrainMapheightAt, not GetRainMapHeightAt: both return the topmost solid Y at that
@@ -295,12 +346,9 @@ public class RoomThermalSystem : ModSystem
         // natural ground level and never moves (IBlockAccessor.cs:474-488). The surface block
         // itself is exposed to the air, hence the strict comparison.
         int surfaceY = acc.GetTerrainMapheightAt(nb);
-        var walls = nb.Y < surfaceY ? geom.GroundWalls : geom.Walls;
-        double u = config.GroundContactU;
-        if (nb.Y < surfaceY) { geom.GroundFaces++; geom.GroundDepthSum += surfaceY - nb.Y; }
-        else u = config.UFor(mat);
-        var prev = walls.GetValueOrDefault(mat);
-        walls[mat] = (prev.Faces + 1, prev.WPerK + u);
+        bool ground = nb.Y < surfaceY;
+        if (ground) { geom.GroundFaces++; geom.GroundDepthSum += surfaceY - nb.Y; }
+        geom.Faces.Add(new Face(nb.Copy(), face, mat, ground ? config.GroundContactU : config.UFor(mat), ground, false, airY));
     }
 
     /// <summary>Heat sources in the bbox expanded by one block. Re-evaluated every tick: a firepit can go out.</summary>
@@ -364,6 +412,113 @@ public class RoomThermalSystem : ModSystem
         return (sum / 12, (max - min) / 2, coldestDay);
     }
 
+    // --- Wind and stratification ---------------------------------------------------------------
+
+    private void UpdateWindAndStratification(RoomEntry e)
+    {
+        e.Wind = WindAt(e);
+        e.WindTemperature = UpwindTemperature(e);
+        e.Gradient = Stratification.Gradient(e.SourceWatts, config.StratificationKPerMPerKW, config.StratificationMaxKPerM);
+
+        // A face at height Y sees T + gradient×(Y + 0.5 − yMid), not the mean T. Keeping the edges on
+        // the mean and injecting −Σ G_f × gradient × (Y_f + 0.5 − yMid) into the room node is the
+        // same set of flows, and it keeps the network linear: one number instead of one node per layer.
+        double yMid = YMid(e), wind = 0, strat = 0;
+        foreach (Face f in e.Geom.Faces)
+        {
+            double extra = WindExtra(f, e.Wind);
+            wind += extra;
+            strat -= (f.UA + extra) * e.Gradient * (f.Y + 0.5 - yMid);
+        }
+        e.WindConductance = wind;
+        e.StratificationWatts = strat;
+    }
+
+    /// <summary>
+    /// Wind two blocks above the roof. Vanilla does not damp it indoors: the survival weather system
+    /// only fills the X component (WeatherSystemBase.Event_OnGetWindSpeed) from the region's wind
+    /// pattern strength, scaled by height alone (WeatherSimulationRegion.GetWindSpeed: amplified up
+    /// to 1.5 above sea level, divided by 1 + depth/4 below it). Sampling above the roof is therefore
+    /// about the exposure of the building, not about being inside or outside.
+    /// </summary>
+    private Vec3d WindAt(RoomEntry e)
+    {
+        Cuboidi c = e.Room.Location;
+        return sapi.World.BlockAccessor.GetWindSpeedAt(
+            new BlockPos((c.MinX + c.MaxX) / 2, c.MaxY + 2, (c.MinZ + c.MaxZ) / 2, e.Dimension));
+    }
+
+    /// <summary>
+    /// The game has no wind temperature, so the incoming air takes the climate of where it comes
+    /// from: up to windSampleDistance blocks upwind (scaled down when the wind is weak, so a calm
+    /// day samples the building itself), at the height of the room or of the upwind terrain,
+    /// whichever is higher. Vanilla's climate cools with altitude, so sampling at the ground would
+    /// hand a tower on a plain a warm wind it never feels; taking the terrain height only when it
+    /// is above the room keeps what matters, air that came over a mountain arriving colder.
+    /// </summary>
+    private double UpwindTemperature(RoomEntry e)
+    {
+        double speed = Horizontal(e.Wind);
+        if (speed <= 0) return e.OutsideTemperature;
+        Cuboidi c = e.Room.Location;
+        double d = config.WindSampleDistance * Math.Clamp(speed / 0.5, 0, 1) / speed;
+        var pos = new BlockPos((int)((c.MinX + c.MaxX) / 2.0 - e.Wind.X * d), 0,
+                               (int)((c.MinZ + c.MaxZ) / 2.0 - e.Wind.Z * d), e.Dimension);
+        pos.Y = Math.Max(sapi.World.BlockAccessor.GetTerrainMapheightAt(pos) + 1, (c.MinY + c.MaxY) / 2);
+        return sapi.World.BlockAccessor.GetClimateAt(pos, EnumGetClimateMode.NowValues)?.Temperature ?? e.OutsideTemperature;
+    }
+
+    /// <summary>
+    /// Extra conductance of one face, W/K. A wall only feels the wind that blows into it
+    /// (UA × factor × max(0, wind·n)); an opening leaks with any wind, a head-on one twice as much.
+    /// A buried face is shielded by the ground.
+    /// </summary>
+    private double WindExtra(in Face f, Vec3d wind)
+    {
+        if (f.Ground) return 0;
+        double headOn = Math.Max(0, wind.X * f.Facing.Normali.X + wind.Z * f.Facing.Normali.Z);
+        return f.Opening
+            ? f.UA * config.WindOpeningFactor * (Horizontal(wind) + headOn) / 2
+            : f.UA * config.WindWallFactor * headOn;
+    }
+
+    private static double Horizontal(Vec3d v) => Math.Sqrt(v.X * v.X + v.Z * v.Z);
+
+    /// <summary>Mid height of the room, in block coordinates (block y spans y..y+1).</summary>
+    private static double YMid(RoomEntry e) => (e.Room.Location.MinY + e.Room.Location.MaxY + 1) / 2.0;
+
+    private static double LocalTemperature(RoomEntry e, int y) => Stratification.At(e.Temperature, e.Gradient, y, YMid(e));
+
+    /// <summary>Air temperature at that height in the room. False if the position is not in a room Caminus tracks.</summary>
+    public bool TryGetLocalTemperature(BlockPos pos, out double temperature)
+    {
+        RoomEntry? e = Find(pos);
+        temperature = e == null ? 0 : LocalTemperature(e, pos.Y);
+        return e != null;
+    }
+
+    /// <summary>Per-face state of the room containing <paramref name="pos"/>, for the client overlay.</summary>
+    public bool TryGetFaceFlows(BlockPos pos, [NotNullWhen(true)] out RoomFlows? flows)
+    {
+        flows = null;
+        RoomEntry? e = Find(pos);
+        if (e == null) return false;
+
+        double yMid = YMid(e);
+        var faces = new List<FaceFlow>(e.Geom.Faces.Count);
+        foreach (Face f in e.Geom.Faces)
+        {
+            double local = Stratification.At(e.Temperature, e.Gradient, f.Y, yMid);
+            double extra = WindExtra(f, e.Wind);
+            double node = f.Ground ? e.GroundTemp : e.OutsideTemperature;
+            faces.Add(new FaceFlow(f, f.UA + extra, f.UA * (local - node) + extra * (local - e.WindTemperature)));
+        }
+        flows = new RoomFlows(e.Temperature, e.OutsideTemperature,
+            e.Geom.GroundFaces == 0 ? double.NaN : e.GroundTemp, e.WindTemperature,
+            e.Wind, e.Gradient, yMid, e.StratificationWatts, faces);
+        return true;
+    }
+
     // --- Persistence -------------------------------------------------------------------------
 
     private static string Key(Cuboidi c, int dim) =>
@@ -406,7 +561,8 @@ public class RoomThermalSystem : ModSystem
     /// T = Teq + (T0 − Teq)·e^(−dt/tau) with tau = C/G: nothing is approximated in the integration,
     /// however long the room stayed away. What IS approximate is Teq: the outside temperature, the
     /// ground and the fire moved while we were not looking, and we relax toward the equilibrium as
-    /// it stands now rather than replaying the history we did not record.
+    /// it stands now rather than replaying the history we did not record. The wind is left out of
+    /// that equilibrium: it has not been sampled yet, and it averages out over the days this covers.
     /// </summary>
     private void Restore(string key, RoomEntry e)
     {
@@ -430,7 +586,6 @@ public class RoomThermalSystem : ModSystem
         {
             Save(e);
             entries.Remove(key);
-            dirty = true;
         }
     }
 
@@ -447,12 +602,41 @@ public class RoomThermalSystem : ModSystem
     public static double PerishRate(double temperature) =>
         Math.Clamp(Math.Pow(3, temperature / 19 - 1.2) - 0.1, 0.1, 2.4);
 
-    /// <summary>False if the position is not inside a room Caminus tracks: the caller keeps vanilla's answer.</summary>
+    /// <summary>
+    /// False if the position is not inside a room Caminus tracks: the caller keeps vanilla's answer.
+    /// The rate follows the air at the container's own height, so a crock on the floor keeps better
+    /// than one on a shelf under the ceiling.
+    /// </summary>
     public bool TryGetPerishRate(BlockPos pos, out float rate)
     {
-        RoomEntry? e = Find(pos);
-        rate = (float)PerishRate(e?.Temperature ?? 0);
+        RoomEntry? e = Find(pos) ?? Discover(pos);
+        rate = (float)PerishRate(e == null ? 0 : LocalTemperature(e, pos.Y));
         return e != null;
+    }
+
+    /// <summary>
+    /// A container asking for its perish rate in a room no player has ever entered: track it, so a
+    /// cellar is discovered by its own crocks. Called from the container's 10 s tick, on the server
+    /// main thread, which is the only place RoomRegistry may be used. Positions that turn out not to
+    /// be in a room are remembered per chunk for a minute, so an outdoor chest costs one flood fill
+    /// per minute instead of one per tick.
+    /// </summary>
+    private RoomEntry? Discover(BlockPos pos)
+    {
+        double now = sapi.World.Calendar.TotalHours;
+        var chunk = (pos.X / GlobalConstants.ChunkSize, pos.Y / GlobalConstants.ChunkSize, pos.Z / GlobalConstants.ChunkSize);
+        if (noRoom.TryGetValue(chunk, out double until) && now < until) return null;
+
+        Room room = rooms.GetRoomForPosition(pos);
+        if (!Enclosed(room))
+        {
+            if (noRoom.Count > 256)
+                foreach (var stale in noRoom.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList()) noRoom.Remove(stale);
+            noRoom[chunk] = now + NoRoomTtlHours;
+            return null;
+        }
+        noRoom.Remove(chunk);
+        return Track(room, pos.dimension);
     }
 
     private RoomEntry? Find(BlockPos pos) =>
@@ -468,6 +652,8 @@ public class RoomThermalSystem : ModSystem
 
         Geometry g = e.Geom;
         double dT = e.Temperature - e.OutsideTemperature;
+        double calm = g.Conductance + g.GroundConductance;
+        double local = LocalTemperature(e, pos.Y);
         // Invariant culture: the report is also parsed by integration scenarios, a decimal
         // separator that changes with the server locale would make the format unstable.
         CultureInfo c = CultureInfo.InvariantCulture;
@@ -477,27 +663,48 @@ public class RoomThermalSystem : ModSystem
             sb.Append(c, $"Ground node: {e.GroundTemp:0.0} °C at {g.GroundDepth:0.0} m").AppendLine();
         sb.Append(c, $"Volume {g.Volume} blocks, capacity {Capacity(g) / 1000:0} kJ/K").AppendLine();
         sb.Append(c, $"Sources: {e.SourceWatts:0} W").AppendLine();
-        sb.Append(c, $"Perish rate: {PerishRate(e.Temperature):0.00}x (vanilla here: {PerishRate(VanillaClimate(e)):0.00}x)").AppendLine();
-        sb.Append(c, $"Losses: {g.Conductance + g.GroundConductance:0.0} W/K, i.e. " +
+        sb.Append(c, $"Wind: {Horizontal(e.Wind):0.00} from the {ComesFrom(e.Wind)} at {e.WindTemperature:0.0} °C " +
+                     $"(+{(calm <= 0 ? 0 : 100 * e.WindConductance / calm):0.#} % losses)").AppendLine();
+        sb.Append(c, $"Stratification: {e.Gradient:0.0} K/m (floor {LocalTemperature(e, e.Room.Location.MinY):0.0} °C, " +
+                     $"eyes {local:0.0} °C, ceiling {LocalTemperature(e, e.Room.Location.MaxY):0.0} °C)").AppendLine();
+        sb.Append(c, $"Perish rate: {PerishRate(local):0.00}x (vanilla here: {PerishRate(VanillaClimate(e)):0.00}x)").AppendLine();
+        // The wind's share is on the Wind line: this one is the fabric of the building, calm air.
+        sb.Append(c, $"Losses: {calm:0.0} W/K, i.e. " +
                      $"{g.Conductance * dT + g.GroundConductance * (e.Temperature - e.GroundTemp):0} W at the current delta").AppendLine();
-        AppendWalls(sb, c, "Outside walls", g.Walls, dT);
-        if (g.Openings > 0)
-        {
-            double w = g.Openings * config.OpeningConductance;
-            sb.Append(c, $"  Openings: {g.Openings} faces, {w:0.0} W/K, {w * dT:0} W").AppendLine();
-        }
-        AppendWalls(sb, c, "Ground walls", g.GroundWalls, e.Temperature - e.GroundTemp);
+        AppendWalls(sb, c, "Outside walls", g.Faces.Where(f => !f.Ground && !f.Opening), dT);
+        AppendOpenings(sb, c, g.Faces.Where(f => f.Opening), dT);
+        AppendWalls(sb, c, "Ground walls", g.Faces.Where(f => f.Ground), e.Temperature - e.GroundTemp);
         report = sb.ToString().TrimEnd();
         return true;
     }
 
-    private static void AppendWalls(StringBuilder sb, CultureInfo c, string title,
-        Dictionary<EnumBlockMaterial, (int Faces, double WPerK)> walls, double dT)
+    private static void AppendWalls(StringBuilder sb, CultureInfo c, string title, IEnumerable<Face> faces, double dT)
     {
-        if (walls.Count == 0) return;
+        var byMaterial = faces.GroupBy(f => f.Material)
+            .Select(gr => (Material: gr.Key, Faces: gr.Count(), WPerK: gr.Sum(f => f.UA)))
+            .OrderByDescending(w => w.WPerK).ToList();
+        if (byMaterial.Count == 0) return;
         sb.Append(title).Append(':').AppendLine();
-        foreach (var (mat, w) in walls.OrderByDescending(w => w.Value.WPerK))
-            sb.Append(c, $"  {mat}: {w.Faces} faces, {w.WPerK:0.0} W/K, {w.WPerK * dT:0} W").AppendLine();
+        foreach (var (mat, count, wPerK) in byMaterial)
+            sb.Append(c, $"  {mat}: {count} faces, {wPerK:0.0} W/K, {wPerK * dT:0} W").AppendLine();
+    }
+
+    private static void AppendOpenings(StringBuilder sb, CultureInfo c, IEnumerable<Face> faces, double dT)
+    {
+        int count = 0;
+        double wPerK = 0;
+        foreach (Face f in faces) { count++; wPerK += f.UA; }
+        if (count == 0) return;
+        sb.Append(c, $"  Openings: {count} faces, {wPerK:0.0} W/K, {wPerK * dT:0} W").AppendLine();
+    }
+
+    /// <summary>
+    /// Compass direction the wind blows FROM. Vintage Story axes: +X east, +Z south.
+    /// </summary>
+    private static string ComesFrom(Vec3d wind)
+    {
+        string[] names = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
+        return names[(int)Math.Round(Math.Atan2(-wind.X, wind.Z) / (Math.PI / 4)) & 7];
     }
 
     /// <summary>
