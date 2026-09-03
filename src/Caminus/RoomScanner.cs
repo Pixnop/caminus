@@ -41,6 +41,10 @@ public sealed class RoomScanner(ICoreServerAPI api, int maxBlocks, int maxExtent
     /// <summary>Half-width of the packing box. Clamped so that its cube still fits an int.</summary>
     private readonly int extent = Math.Clamp(maxExtent, 1, 256);
     private ICachingBlockAccessor? cache;
+    // State of the fill in progress, kept out of the call chain like the queue and the visited set.
+    private BlockPos scanSeed = new(0);
+    private BlockPos scanNb = new(0);
+    private Cuboidi scanBox = new(0, 0, 0, 0, 0, 0);
 
     private int Span => 2 * extent + 1;
 
@@ -68,8 +72,9 @@ public sealed class RoomScanner(ICoreServerAPI api, int maxBlocks, int maxExtent
         queue.Clear();
         visited.Add(Index(0, 0, 0));
         queue.Enqueue(Index(0, 0, 0));
-        var box = new Cuboidi(0, 0, 0, 0, 0, 0);
-        var nb = new BlockPos(seed.dimension);
+        scanSeed = seed;
+        scanBox = new Cuboidi(0, 0, 0, 0, 0, 0);
+        scanNb = new BlockPos(seed.dimension);
         var cur = new BlockPos(seed.dimension);
 
         while (queue.Count > 0)
@@ -81,17 +86,17 @@ public sealed class RoomScanner(ICoreServerAPI api, int maxBlocks, int maxExtent
                 // Vanilla (RoomRegistry.cs:398) first asks the block we are leaving whether its own
                 // face retains heat: a slab floor stops the fill even though its top is walkable air.
                 if (here.Id != 0 && here.GetRetention(cur, face, EnumRetentionType.Heat) != 0) continue;
-                if (!Visit(acc, seed, nb, box, dx + face.Normali.X, dy + face.Normali.Y, dz + face.Normali.Z, face)) return null;
+                if (!Visit(acc, dx + face.Normali.X, dy + face.Normali.Y, dz + face.Normali.Z, face)) return null;
             }
         }
-        return Build(seed, box);
+        return Build(seed, scanBox);
     }
 
     /// <summary>Crosses into one neighbour if the fill may. False when a budget is exceeded.</summary>
-    private bool Visit(ICachingBlockAccessor acc, BlockPos seed, BlockPos nb, Cuboidi box, int nx, int ny, int nz, BlockFacing face)
+    private bool Visit(ICachingBlockAccessor acc, int nx, int ny, int nz, BlockFacing face)
     {
-        if (!Traversable(acc, nb.Set(seed.X + nx, seed.Y + ny, seed.Z + nz), face)) return true;
-        if (!Grow(box, nx, ny, nz)) return false;
+        if (!Traversable(acc, scanNb.Set(scanSeed.X + nx, scanSeed.Y + ny, scanSeed.Z + nz), face)) return true;
+        if (!Grow(scanBox, nx, ny, nz)) return false;
         int index = Index(nx, ny, nz);
         if (!visited.Add(index)) return true;
         if (visited.Count > maxBlocks) return false;
