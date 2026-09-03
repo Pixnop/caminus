@@ -51,8 +51,14 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [GeneratedRegex(@"Wind: (\d+(?:\.\d+)?) ")]
     private static partial Regex WindSpeed();
 
-    [GeneratedRegex(@"\(\+(\d+(?:\.\d+)?) % losses\)")]
+    [GeneratedRegex(@"\(\+(\d+(?:\.\d+)?) % losses")]
     private static partial Regex WindLosses();
+
+    [GeneratedRegex(@"Sun: \d+(?:\.\d+)? \(forest shade \d+(?:\.\d+)?, \+(-?\d+) W\)")]
+    private static partial Regex SunWatts();
+
+    [GeneratedRegex(@"Sources: -?\d+ W \(nearby (-?\d+) W\)")]
+    private static partial Regex NearbyWatts();
 
     [GeneratedRegex(@"floor (-?\d+(?:\.\d+)?) °C")]
     private static partial Regex FloorTemp();
@@ -304,7 +310,9 @@ public partial class ThermalScenarios : AtlasScenarioBase
             $"the firepit barely warmed the room, nothing to look at\n{report}");
         Assert.DoesNotContain(flows.Faces, f => f.Watts <= 0);
 
-        double sum = flows.Faces.Sum(f => f.Watts), losses = Read(LossWatts(), report);
+        // The Losses line is the fabric against the outside air; each face also sees whatever sun falls
+        // on it, which is the same Sun line the report prints, so the two still have to add up.
+        double sum = flows.Faces.Sum(f => f.Watts), losses = Read(LossWatts(), report) - SunOf(report);
         Assert.True(Math.Abs(sum - losses) < 0.05 * losses,
             $"the faces add up to {sum:0} W, the report says {losses:0} W\n{report}");
 
@@ -312,6 +320,82 @@ public partial class ThermalScenarios : AtlasScenarioBase
         Assert.Equal(54, blocks.Count);
         Assert.Equal(blocks.Count, colors.Count);
         Assert.StartsWith("Room ", OverlayServer.Describe(flows, inside.Y));
+    }
+
+    /// <summary>
+    /// A lava pocket walled into the rock under the floor. The room's air bbox starts one block above
+    /// the shell, so lava 5 blocks below the interior floor sits 3 blocks of rock past the first wall
+    /// layer: 12 heat units x 400 W, attenuated by 1/(1+3), i.e. 1200 W that a bbox+1 scan would miss.
+    /// Geology and forest density cannot be driven in Atlas's superflat world (one climate map, no
+    /// hot springs): their formulas are covered by Caminus.Core.Tests.ExposureTests instead.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Lava_under_the_floor_heats_the_cellar_through_rock()
+    {
+        BlockPos control = await Room("CaminusNoLava", 520, Stone);
+        BlockPos heated = await Room("CaminusLava", 560, Stone);
+        await WaitForRoomReport(control);
+        await WaitForRoomReport(heated);
+
+        // The pocket crosses a chunk boundary below the box: wait for that chunk too, or SetBlock is a no-op.
+        BlockPos lava = heated.Offset(0, -5, 0);
+        await World.Until(() => World.Api.World.BlockAccessor.GetChunkAtBlockPos(lava.Offset(0, -1, 0)) != null, 1200);
+        // Lava spreads: it only stays put walled in on all six sides.
+        for (int x = -1; x <= 1; x++)
+            for (int y = -1; y <= 1; y++)
+                for (int z = -1; z <= 1; z++)
+                    World.SetBlock(Stone, lava.Offset(x, y, z));
+        World.SetBlock("game:lava-still-7", lava);
+
+        string report = await WaitForRoomReport(heated, r => NearbyWatts().IsMatch(r));
+        Assert.Contains("Sources: 1200 W (nearby 1200 W)", report);
+
+        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+        await World.Ticks(300);
+
+        string warm = await ReportAt(heated), cold = await ReportAt(control);
+        // 1200 W over a 162 W/K stone box is +7.4 K at equilibrium; the two boxes are 40 blocks apart
+        // at the same height, so they share their climate, their wind and their sun.
+        double gain = Read(RoomTemp(), warm) - Read(RoomTemp(), cold);
+        Assert.True(gain > 1.0, $"the lava is worth {gain:0.00} K\nlava:\n{warm}\ncontrol:\n{cold}");
+        Assert.DoesNotContain("nearby", cold);
+    }
+
+    /// <summary>
+    /// Sol-air gain: the same box at noon and at midnight. Atlas's superflat sky is open, so every
+    /// outside face reads full sunlight and only the sun's height above the horizon changes.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 180_000)]
+    public async Task Sun_warms_the_roof_by_day()
+    {
+        BlockPos inside = await Room("CaminusSun", 600, Stone);
+        await WaitForRoomReport(inside);
+        // Back to real time: the polling below must not drag the clock across sunrise.
+        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
+
+        // The 9 roof faces take the sun's noon height and the walls it shines on take the horizontal
+        // cosine of incidence, so the exact wattage moves with the season and the latitude.
+        string noon = await ReportAtHour(inside, 12, r => SunOf(r) > 0);
+        Assert.True(SunOf(noon) > 0, $"no sun at noon\n{noon}");
+
+        string night = await ReportAtHour(inside, 0, r => SunOf(r) == 0);
+        Assert.Equal(0, SunOf(night));
+        Assert.Contains("Sun: 0.0 (", night);
+    }
+
+    /// <summary>Winds the calendar forward to the next occurrence of that hour, then polls the report.</summary>
+    private async Task<string> ReportAtHour(BlockPos pos, double hour, Func<string, bool> ready)
+    {
+        Vintagestory.API.Common.IGameCalendar cal = World.Api.World.Calendar;
+        cal.Add((float)(((hour - cal.HourOfDay) % cal.HoursPerDay + cal.HoursPerDay) % cal.HoursPerDay));
+        return await WaitForRoomReport(pos, ready);
+    }
+
+    /// <summary>Solar watts of a report, -1 when the room is not reporting yet.</summary>
+    private static double SunOf(string report)
+    {
+        Match m = SunWatts().Match(report);
+        return m.Success ? double.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : -1;
     }
 
     // Room_temperature_survives_a_restart is NOT an Atlas scenario. [AtlasScenario(RestartWorld = true)]

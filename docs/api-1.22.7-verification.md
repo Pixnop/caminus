@@ -245,6 +245,37 @@ Driving it from a test or a command: `/weather setw <pattern>` (`WeatherSystemCo
 a player) or, in process, `WeatherSystemBase.weatherSimByMapRegion` (public field) and
 `WeatherSimulationRegion.SetWindPattern(code, updateInstant)` (public), plus `dummySim`.
 
+## 12. Sun, geology and forest
+
+`ClimateCondition.GeologicActivity` and `ForestDensity` are both normalized 0..1 and both filled only
+when `getWorldGenClimateAt` is called with `temperatureRainfallOnly = false` (ServerWorldMap.cs:610-643),
+i.e. in every mode **except** `ForSuppliedDate_TemperatureOnly` and `ForSuppliedDate_TemperatureRainfallOnly`.
+Both are worldgen values that never move, so one sample per room is enough.
+
+Geologic activity is `(rnd/255)^(1/strength) × 255`, `strength` being the `geologicActivity` world
+config (NoiseClimateRealistic.cs:66, GenMaps.cs:222; dropdown `0 / 0.05 / 0.1 / 0.2 / 0.4`, default
+0.05 "Rare"). At the default the exponent is 20, so the value is near zero almost everywhere:
+`P(activity > a) = 1 − a^0.05`, i.e. 21 % of positions above 0.01, 11 % above 0.1, 3.4 % above 0.5.
+The geologically interesting places, the ones where `GenRivulets` puts lava, are that top few percent.
+
+Sunlight: `IBlockAccessor.GetLightLevel(BlockPos, EnumLightLevelType.OnlySunLight)` returns the stored
+sun level, 0 to `IWorldAccessor.SunBrightness` = **24** server side (ServerMain.cs:223), with the
+day/night cycle taken out, so it is a fixed geometric sky exposure. An unloaded chunk answers
+SunBrightness (BlockAccessorBase.cs:669-674).
+
+**`Calendar.GetDayLightStrength` never returns 0.** It is `max(moonlight, sunlightTexture + zenith bonus)`
+(GameCalendar.cs:394-414): at night the texture's leftmost pixel is (14,12,18)/255 = 0.057 and a full
+moon adds up to 0.33. For "is the sun up", use `Calendar.GetSunPosition(pos, TotalDays).Y`, which is
+`cos(zenith)` (l.215-222) and goes negative at night. The real spherical coordinates come from the
+survival mod (`SurvivalCoreSystem.GetSolarSphericalCoords`, latitude and axial tilt, hooked at
+`EnumServerRunPhase.GameReady`); without it `GameCalendar`'s own fallback returns zenith 0, i.e.
+permanent noon.
+
+Lava and boiling water carry `BlockBehaviorHeatSource` in their JSON (`survival/blocktypes/liquid/lava.json`
+`heatStrength: 12`, `boilingwater.json` 3), and `Block.GetInterface<IHeatSource>` finds a block behavior
+(Block.cs:2722). Liquids live in the fluid layer, but `GetBlock(pos)` with the default layer falls back
+to it when the solid layer is empty, so a lava block is found without asking for `BlockLayersAccess.Fluid`.
+
 ## Names cited from memory vs. reality
 
 | Cited | Real |

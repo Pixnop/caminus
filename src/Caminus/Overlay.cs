@@ -13,7 +13,7 @@ namespace Caminus;
 [ProtoContract]
 public class OverlayPacket
 {
-    [ProtoMember(1)] public string Text = "";
+    [ProtoMember(1)] public string Text { get; set; } = "";
 }
 
 /// <summary>
@@ -182,8 +182,11 @@ public class OverlayServer : ModSystem
         var sb = new StringBuilder();
         sb.Append(c, $"Room {flows.Temperature:0.0} °C   outside {flows.OutsideTemperature:0.0} °C");
         if (!double.IsNaN(flows.GroundTemperature)) sb.Append(c, $"   ground {flows.GroundTemperature:0.0} °C");
+        if (flows.GeologicActivity > 0) sb.Append(c, $"   geology {flows.GeologicActivity:0.00}");
         sb.AppendLine();
-        sb.Append(c, $"Wind {wind:0.00} from the {RoomThermalSystem.ComesFrom(flows.Wind)} at {flows.WindTemperature:0.0} °C").AppendLine();
+        sb.Append(c, $"Wind {wind:0.00} from the {RoomThermalSystem.ComesFrom(flows.Wind)} at {flows.WindTemperature:0.0} °C");
+        if (flows.ForestDensity > 0) sb.Append(c, $"   forest {flows.ForestDensity:0.00}");
+        sb.Append(c, $"   sun {flows.SolarWatts:+0;-0;0} W").AppendLine();
         // Faces count heat leaving as positive; the player reads a room that loses heat as negative.
         sb.Append(c, $"Floor {Local(flows, floorY):0.0} °C   eyes {Local(flows, eyeY):0.0} °C   " +
                      $"ceiling {Local(flows, ceilingY):0.0} °C   net {-watts:0} W");

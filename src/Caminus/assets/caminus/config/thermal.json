@@ -9,6 +9,11 @@
   "windSampleDistance": 64,
   "stratificationKPerMPerKW": 0.4,
   "stratificationMaxKPerM": 2.0,
+  "geothermalKPerActivity": 20,
+  "sourceScanMargin": 4,
+  "solAirMaxK": 12,
+  "forestShade": 0.7,
+  "forestShelter": 0.7,
   "wallU": {
     "Stone": 3.0,
     "Brick": 2.5,

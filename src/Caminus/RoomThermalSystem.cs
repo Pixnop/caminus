@@ -32,6 +32,16 @@ public class ThermalConfig
     public double WindSampleDistance { get; set; } = 64;
     public double StratificationKPerMPerKW { get; set; } = 0.4;
     public double StratificationMaxKPerM { get; set; } = 2.0;
+    /// <summary>Ground node warming per unit of <c>ClimateCondition.GeologicActivity</c> (0..1), K.</summary>
+    public double GeothermalKPerActivity { get; set; } = 20;
+    /// <summary>How many blocks of rock beyond the envelope the heat-source scan reaches into.</summary>
+    public int SourceScanMargin { get; set; } = 4;
+    /// <summary>Sol-air excess of a face in full sun, straight at the sun, K.</summary>
+    public double SolAirMaxK { get; set; } = 12;
+    /// <summary>Share of the sun a fully forested position keeps off the walls.</summary>
+    public double ForestShade { get; set; } = 0.7;
+    /// <summary>Share of the wind a fully forested position keeps off the walls.</summary>
+    public double ForestShelter { get; set; } = 0.7;
     public Dictionary<EnumBlockMaterial, double> WallU { get; set; } = [];
 
     public double UFor(EnumBlockMaterial mat) => WallU.TryGetValue(mat, out double u) ? u : 3.0;
@@ -43,7 +53,9 @@ public class ThermalConfig
 /// <param name="UA">Conductance of the face in calm air, W/K.</param>
 /// <param name="Y">Height of the room-side air block, the air actually touching the face: same as
 /// <paramref name="Pos"/>.Y except for the floor and ceiling faces.</param>
-public readonly record struct Face(BlockPos Pos, BlockFacing Facing, EnumBlockMaterial Material, double UA, bool Ground, bool Opening, int Y);
+/// <param name="Sun">How much sky the block just outside the face sees, 0..1, measured once at
+/// geometry time and independent of the time of day. 0 on a buried face.</param>
+public readonly record struct Face(BlockPos Pos, BlockFacing Facing, EnumBlockMaterial Material, double UA, bool Ground, bool Opening, int Y, double Sun);
 
 /// <summary>A face with what it is doing right now. Positive <paramref name="Watts"/> = heat leaving the room.</summary>
 public readonly record struct FaceFlow(Face Face, double Conductance, double Watts);
@@ -51,7 +63,8 @@ public readonly record struct FaceFlow(Face Face, double Conductance, double Wat
 /// <summary>Everything a client overlay needs to draw one room. GroundTemperature is NaN if the room touches no ground.</summary>
 public sealed record RoomFlows(
     double Temperature, double OutsideTemperature, double GroundTemperature, double WindTemperature,
-    Vec3d Wind, double Gradient, double YMid, double StratificationWatts, IReadOnlyList<FaceFlow> Faces);
+    Vec3d Wind, double Gradient, double YMid, double StratificationWatts, IReadOnlyList<FaceFlow> Faces,
+    double SolarWatts, double GeologicActivity, double ForestDensity);
 
 /// <summary>
 /// Thermal simulation of the rooms players are in. Server side only: RoomRegistry
@@ -90,7 +103,10 @@ public class RoomThermalSystem : ModSystem
         public double Temperature;
         public double OutsideTemperature;
         public double GroundTemp;
+        /// <summary>Sources inside the room or in the wall touching it, W.</summary>
         public double SourceWatts;
+        /// <summary>Sources further out, already attenuated by the rock between them and the room, W.</summary>
+        public double NearbyWatts;
         /// <summary>Wind above the roof, game units. Vanilla only ever fills X (see <see cref="WindAt"/>).</summary>
         public Vec3d Wind = new();
         /// <summary>Temperature of the air the wind brings in, sampled upwind.</summary>
@@ -100,6 +116,18 @@ public class RoomThermalSystem : ModSystem
         public double Gradient;
         /// <summary>Power the vertical gradient costs the room, W (negative: the ceiling loses more than the floor gains).</summary>
         public double StratificationWatts;
+        /// <summary>Power the sun-warmed envelope pushes into the room, W.</summary>
+        public double SolarWatts;
+        /// <summary>Height of the sun above the horizon, 0 at night, 1 at the zenith.</summary>
+        public double Daylight;
+        /// <summary>What each facing catches of the sun right now, indexed by <c>BlockFacing.Index</c>.</summary>
+        public readonly double[] SunFactor = new double[6];
+        /// <summary>What the forest lets through: 1 in the open, <c>1 − forestShade</c> under a full canopy.</summary>
+        public double Shade = 1;
+        /// <summary>Same for the wind, with <c>forestShelter</c>.</summary>
+        public double Shelter = 1;
+        /// <summary>Geologic activity and forest density here, both 0..1, fixed at worldgen and sampled once.</summary>
+        public (double Geologic, double Forest)? Land;
         public bool HasPlayer;
         public long Ticks;
         /// <summary>Game hours at the last simulated step: the base for offline relaxation.</summary>
@@ -177,14 +205,15 @@ public class RoomThermalSystem : ModSystem
         {
             e.OutsideTemperature = OutsideTemperature(e);
             e.GroundTemp = GroundTemperatureOf(e);
-            // The 16³ block scan is the expensive part of the tick; an empty room can afford to see
-            // its firepit go out 10 s late.
-            if (e.HasPlayer || e.Ticks % UnoccupiedSourceScanTicks == 0) e.SourceWatts = SourceWatts(e.Room, e.Dimension);
+            // The block scan is the expensive part of the tick; an empty room can afford to see
+            // its firepit go out 10 s late, and the rock around it never changes on its own.
+            bool outer = e.Ticks % UnoccupiedSourceScanTicks == 0;
+            if (e.HasPlayer || outer) ScanSources(e, outer);
             e.Ticks++;
-            UpdateWindAndStratification(e);
+            UpdateWindSunAndStratification(e);
 
             e.Net.SetTemperature(e.OutsideNode, e.OutsideTemperature);
-            e.Net.SetSourcePower(e.Node, e.SourceWatts + e.StratificationWatts);
+            e.Net.SetSourcePower(e.Node, e.SourceWatts + e.NearbyWatts + e.StratificationWatts + e.SolarWatts);
             e.Net.SetEdgeConductance(e.Edge, e.Geom.Conductance);
             e.Net.SetTemperature(e.WindNode, e.WindTemperature);
             e.Net.SetEdgeConductance(e.WindEdge, e.WindConductance);
@@ -335,7 +364,7 @@ public class RoomThermalSystem : ModSystem
         // pane or a chiseled block retains heat even though its faces are not "solid".
         if (block == null || block.GetRetention(nb, face.Opposite, EnumRetentionType.Heat) == 0)
         {
-            geom.Faces.Add(new Face(nb.Copy(), face, EnumBlockMaterial.Air, config.OpeningConductance, false, true, airY));
+            geom.Faces.Add(new Face(nb.Copy(), face, EnumBlockMaterial.Air, config.OpeningConductance, false, true, airY, SkyExposure(acc, nb, face)));
             return;
         }
         EnumBlockMaterial mat = block.GetBlockMaterial(acc, nb);
@@ -348,25 +377,50 @@ public class RoomThermalSystem : ModSystem
         int surfaceY = acc.GetTerrainMapheightAt(nb);
         bool ground = nb.Y < surfaceY;
         if (ground) { geom.GroundFaces++; geom.GroundDepthSum += surfaceY - nb.Y; }
-        geom.Faces.Add(new Face(nb.Copy(), face, mat, ground ? config.GroundContactU : config.UFor(mat), ground, false, airY));
+        geom.Faces.Add(new Face(nb.Copy(), face, mat, ground ? config.GroundContactU : config.UFor(mat), ground, false, airY,
+            ground ? 0 : SkyExposure(acc, nb, face)));
     }
 
-    /// <summary>Heat sources in the bbox expanded by one block. Re-evaluated every tick: a firepit can go out.</summary>
-    // ponytail: up to 16³ GetBlock calls per room per second; switch to a cache of source positions invalidated on ChunkDirty if this gets heavy.
-    private double SourceWatts(Room room, int dim)
+    /// <summary>
+    /// How much sky the block just outside the wall sees, 0..1: its stored sunlight level
+    /// (<c>OnlySunLight</c>, 0..<c>SunBrightness</c> = 24 server side, BlockAccessorBase.cs:669-684)
+    /// which is the daylight cycle taken out, exactly what a fixed geometric exposure needs. An
+    /// unloaded chunk answers SunBrightness, i.e. full sky.
+    /// </summary>
+    private double SkyExposure(IBlockAccessor acc, BlockPos wall, BlockFacing face) =>
+        Math.Clamp((double)acc.GetLightLevel(wall.AddCopy(face), EnumLightLevelType.OnlySunLight)
+                   / Math.Max(1, sapi.World.SunBrightness), 0, 1);
+
+    /// <summary>
+    /// Heat sources in and around the room. What sits in the room or in the wall touching it counts in
+    /// full and lands in <see cref="RoomEntry.SourceWatts"/>; a lava lake or a hot spring further out
+    /// only reaches the room through the rock, so it is divided by 1 + its Chebyshev distance past
+    /// that first wall and lands in <see cref="RoomEntry.NearbyWatts"/>.
+    /// </summary>
+    // ponytail: the first shell is walked every tick because a firepit goes out, the rock beyond it
+    // only on the 10-tick beat, where the scan costs (bbox + 2×margin)³ GetBlock calls. Cache the
+    // source positions and invalidate on ChunkDirty if that ever shows up in a profile.
+    private void ScanSources(RoomEntry e, bool outer)
     {
-        Cuboidi c = room.Location;
-        double strength = 0;
-        var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, dim);
-        for (int x = c.MinX - 1; x <= c.MaxX + 1; x++)
-            for (int y = c.MinY - 1; y <= c.MaxY + 1; y++)
-                for (int z = c.MinZ - 1; z <= c.MaxZ + 1; z++)
+        Cuboidi c = e.Room.Location;
+        int m = outer ? Math.Max(1, config.SourceScanMargin) : 1;
+        double inside = 0, nearby = 0;
+        var pos = new BlockPos(c.MinX, c.MinY, c.MinZ, e.Dimension);
+        for (int x = c.MinX - m; x <= c.MaxX + m; x++)
+            for (int y = c.MinY - m; y <= c.MaxY + m; y++)
+                for (int z = c.MinZ - m; z <= c.MaxZ + m; z++)
                 {
                     pos.Set(x, y, z);
                     IHeatSource? src = sapi.World.BlockAccessor.GetBlock(pos)?.GetInterface<IHeatSource>(sapi.World, pos);
-                    if (src != null) strength += src.GetHeatStrength(sapi.World, pos, pos);
+                    if (src == null) continue;
+                    double watts = src.GetHeatStrength(sapi.World, pos, pos) * config.WattsPerHeatStrength;
+                    int d = Math.Max(Exposure.Beyond(x, c.MinX, c.MaxX),
+                            Math.Max(Exposure.Beyond(y, c.MinY, c.MaxY), Exposure.Beyond(z, c.MinZ, c.MaxZ)));
+                    if (d == 0) inside += watts; else nearby += watts * Exposure.Reach(d);
                 }
-        return strength * config.WattsPerHeatStrength;
+        e.SourceWatts = inside;
+        // A pass that stopped at the first shell has seen nothing of the rock: keep what the last full one found.
+        if (outer) e.NearbyWatts = nearby;
     }
 
     private double OutsideTemperature(RoomEntry e) => ClimateTemperature(e.Room.Location, e.Dimension) ?? e.OutsideTemperature;
@@ -377,13 +431,35 @@ public class RoomThermalSystem : ModSystem
 
     private static BlockPos Center(Cuboidi c, int dim) => new((c.MinX + c.MaxX) / 2, (c.MinY + c.MaxY) / 2, (c.MinZ + c.MaxZ) / 2, dim);
 
-    /// <summary>Kusuda wave at the mean burial depth of the room's ground faces.</summary>
+    /// <summary>
+    /// Kusuda wave at the mean burial depth of the room's ground faces, plus the geothermal offset of
+    /// the region: the rock under a geologically active place is simply warmer.
+    /// </summary>
     private double GroundTemperatureOf(RoomEntry e)
     {
         if (e.Geom.GroundFaces == 0) return e.OutsideTemperature;
         IGameCalendar cal = sapi.World.Calendar;
         (double mean, double amplitude, double coldestDay) = e.Climate ??= SampleSurfaceClimate(e);
-        return GroundTemperature.At(mean, amplitude, coldestDay, e.Geom.GroundDepth, cal.DayOfYearf, cal.DaysPerYear);
+        return GroundTemperature.At(mean, amplitude, coldestDay, e.Geom.GroundDepth, cal.DayOfYearf, cal.DaysPerYear)
+               + config.GeothermalKPerActivity * Land(e).Geologic;
+    }
+
+    /// <summary>
+    /// Geologic activity and forest density here, both normalized 0..1 and both fixed at world
+    /// generation, so one sample per room is enough. Only the worldgen climate carries them:
+    /// <c>ServerWorldMap.getWorldGenClimateAt</c> (l.610) skips both in the temperature-only modes,
+    /// and <c>WorldGenValues</c> is also the mode that does not run the weather system on top.
+    /// A null answer means the region was not loaded: try again next tick rather than cache a zero.
+    /// </summary>
+    private (double Geologic, double Forest) Land(RoomEntry e)
+    {
+        if (e.Land == null)
+        {
+            ClimateCondition? c = sapi.World.BlockAccessor.GetClimateAt(
+                Center(e.Room.Location, e.Dimension), EnumGetClimateMode.WorldGenValues);
+            if (c != null) e.Land = (c.GeologicActivity, c.ForestDensity);
+        }
+        return e.Land ?? (0, 0);
     }
 
     /// <summary>
@@ -414,24 +490,58 @@ public class RoomThermalSystem : ModSystem
 
     // --- Wind and stratification ---------------------------------------------------------------
 
-    private void UpdateWindAndStratification(RoomEntry e)
+    private void UpdateWindSunAndStratification(RoomEntry e)
     {
+        double forest = Land(e).Forest;
+        e.Shade = 1 - config.ForestShade * forest;
+        e.Shelter = 1 - config.ForestShelter * forest;
         e.Wind = WindAt(e);
         e.WindTemperature = UpwindTemperature(e);
+        UpdateSunFactors(e);
         e.Gradient = Stratification.Gradient(e.SourceWatts, config.StratificationKPerMPerKW, config.StratificationMaxKPerM);
 
         // A face at height Y sees T + gradient×(Y + 0.5 − yMid), not the mean T. Keeping the edges on
         // the mean and injecting −Σ G_f × gradient × (Y_f + 0.5 − yMid) into the room node is the
         // same set of flows, and it keeps the network linear: one number instead of one node per layer.
-        double yMid = YMid(e), wind = 0, strat = 0;
+        // The sun is folded in the same way: a sunlit face sees air warmer by its sol-air excess, which
+        // is +Σ UA_f × solAir_f into the room node. Only the fabric conductance carries it: the extra
+        // the wind opens up leads to air that comes from upwind and never touched the warm wall.
+        double yMid = YMid(e), wind = 0, strat = 0, sun = 0;
         foreach (Face f in e.Geom.Faces)
         {
-            double extra = WindExtra(f, e.Wind);
+            double extra = WindExtra(f, e.Wind, e.Shelter);
             wind += extra;
             strat -= (f.UA + extra) * e.Gradient * (f.Y + 0.5 - yMid);
+            sun += f.UA * SolAir(e, f);
         }
         e.WindConductance = wind;
         e.StratificationWatts = strat;
+        e.SolarWatts = sun;
+    }
+
+    private double SolAir(RoomEntry e, in Face f) =>
+        Exposure.SolAir(config.SolAirMaxK, f.Sun, e.SunFactor[f.Facing.Index], e.Shade);
+
+    /// <summary>
+    /// Where the sun is, once per room per tick, turned into what each of the six facings catches of
+    /// it (<see cref="Exposure.Incidence"/>): the roof takes its height, the wall it shines on takes
+    /// the horizontal cosine of incidence and the wall behind the building takes nothing.
+    /// <c>Calendar.GetSunPosition(pos, totalDays)</c> is the unit vector pointing at the sun, built
+    /// from cos(zenith) and the azimuth (GameCalendar.cs:215-222); the survival mod fills the real
+    /// spherical coordinates (SurvivalCoreSystem.cs:131, latitude and axial tilt included).
+    /// <c>GetDayLightStrength</c> would be the obvious call for the day/night part, but it never
+    /// reaches 0: it keeps the moon (up to 0.33) and a 0.06 floor from the sunlight texture
+    /// (GameCalendar.cs:404-413), and moonlight has no business warming a wall.
+    /// </summary>
+    private void UpdateSunFactors(RoomEntry e)
+    {
+        Cuboidi c = e.Room.Location;
+        IGameCalendar cal = sapi.World.Calendar;
+        Vec3f sun = cal.GetSunPosition(new Vec3d((c.MinX + c.MaxX) / 2.0, c.MaxY, (c.MinZ + c.MaxZ) / 2.0), cal.TotalDays);
+        e.Daylight = Math.Max(0, sun.Y);
+        // Face.Facing points from the room toward the wall, so its normal is the one pointing at the sky.
+        foreach (BlockFacing face in BlockFacing.ALLFACES)
+            e.SunFactor[face.Index] = Exposure.Incidence(sun.X, sun.Y, sun.Z, face.Normali.X, face.Normali.Y, face.Normali.Z);
     }
 
     /// <summary>
@@ -471,15 +581,15 @@ public class RoomThermalSystem : ModSystem
     /// <summary>
     /// Extra conductance of one face, W/K. A wall only feels the wind that blows into it
     /// (UA × factor × max(0, wind·n)); an opening leaks with any wind, a head-on one twice as much.
-    /// A buried face is shielded by the ground.
+    /// A buried face is shielded by the ground, and so, in part, is a building in a forest.
     /// </summary>
-    private double WindExtra(in Face f, Vec3d wind)
+    private double WindExtra(in Face f, Vec3d wind, double shelter)
     {
         if (f.Ground) return 0;
         double headOn = Math.Max(0, wind.X * f.Facing.Normali.X + wind.Z * f.Facing.Normali.Z);
-        return f.Opening
+        return shelter * (f.Opening
             ? f.UA * config.WindOpeningFactor * (Horizontal(wind) + headOn) / 2
-            : f.UA * config.WindWallFactor * headOn;
+            : f.UA * config.WindWallFactor * headOn);
     }
 
     private static double Horizontal(Vec3d v) => Math.Sqrt(v.X * v.X + v.Z * v.Z);
@@ -509,13 +619,18 @@ public class RoomThermalSystem : ModSystem
         foreach (Face f in e.Geom.Faces)
         {
             double local = Stratification.At(e.Temperature, e.Gradient, f.Y, yMid);
-            double extra = WindExtra(f, e.Wind);
+            double extra = WindExtra(f, e.Wind, e.Shelter);
+            // The sun does not warm the ground, and it only lifts the outside air the fabric sees:
+            // what blows in through the wind's extra conductance comes from upwind, off a cold wall.
+            double sol = f.Ground ? 0 : SolAir(e, f);
             double node = f.Ground ? e.GroundTemp : e.OutsideTemperature;
-            faces.Add(new FaceFlow(f, f.UA + extra, f.UA * (local - node) + extra * (local - e.WindTemperature)));
+            faces.Add(new FaceFlow(f, f.UA + extra,
+                f.UA * (local - node - sol) + extra * (local - e.WindTemperature)));
         }
+        (double geologic, double forest) = Land(e);
         flows = new RoomFlows(e.Temperature, e.OutsideTemperature,
             e.Geom.GroundFaces == 0 ? double.NaN : e.GroundTemp, e.WindTemperature,
-            e.Wind, e.Gradient, yMid, e.StratificationWatts, faces);
+            e.Wind, e.Gradient, yMid, e.StratificationWatts, faces, e.SolarWatts, geologic, forest);
         return true;
     }
 
@@ -574,8 +689,9 @@ public class RoomThermalSystem : ModSystem
 
         double g = e.Geom.Conductance + e.Geom.GroundConductance;
         if (g <= 0) { e.Temperature = saved.Temperature; return; }
+        ScanSources(e, outer: true);
         double teq = (e.Geom.Conductance * e.OutsideTemperature + e.Geom.GroundConductance * e.GroundTemp
-                      + SourceWatts(e.Room, e.Dimension)) / g;
+                      + e.SourceWatts + e.NearbyWatts) / g;
         double dt = Math.Max(0, sapi.World.Calendar.TotalHours - saved.TotalHours) * 3600;
         e.Temperature = ThermalNetwork.Relax(saved.Temperature, teq, dt, Capacity(e.Geom) / g);
     }
@@ -658,13 +774,22 @@ public class RoomThermalSystem : ModSystem
         // separator that changes with the server locale would make the format unstable.
         CultureInfo c = CultureInfo.InvariantCulture;
         var sb = new StringBuilder();
+        (double geologic, double forest) = Land(e);
         sb.Append(c, $"Room: {e.Temperature:0.0} °C, outside {e.OutsideTemperature:0.0} °C").AppendLine();
         if (g.GroundFaces > 0)
-            sb.Append(c, $"Ground node: {e.GroundTemp:0.0} °C at {g.GroundDepth:0.0} m").AppendLine();
+        {
+            sb.Append(c, $"Ground node: {e.GroundTemp:0.0} °C at {g.GroundDepth:0.0} m");
+            if (geologic > 0) sb.Append(c, $" (geology {geologic:0.00}, +{config.GeothermalKPerActivity * geologic:0.0} K)");
+            sb.AppendLine();
+        }
         sb.Append(c, $"Volume {g.Volume} blocks, capacity {Capacity(g) / 1000:0} kJ/K").AppendLine();
-        sb.Append(c, $"Sources: {e.SourceWatts:0} W").AppendLine();
+        sb.Append(c, $"Sources: {e.SourceWatts + e.NearbyWatts:0} W");
+        if (e.NearbyWatts != 0) sb.Append(c, $" (nearby {e.NearbyWatts:0} W)");
+        sb.AppendLine();
         sb.Append(c, $"Wind: {Horizontal(e.Wind):0.00} from the {ComesFrom(e.Wind)} at {e.WindTemperature:0.0} °C " +
-                     $"(+{(calm <= 0 ? 0 : 100 * e.WindConductance / calm):0.#} % losses)").AppendLine();
+                     $"(+{(calm <= 0 ? 0 : 100 * e.WindConductance / calm):0.#} % losses, " +
+                     $"forest shelter {100 * (1 - e.Shelter):0.#} %)").AppendLine();
+        sb.Append(c, $"Sun: {e.Daylight:0.0#} (forest shade {1 - e.Shade:0.0#}, +{e.SolarWatts:0} W)").AppendLine();
         sb.Append(c, $"Stratification: {e.Gradient:0.0} K/m (floor {LocalTemperature(e, e.Room.Location.MinY):0.0} °C, " +
                      $"eyes {local:0.0} °C, ceiling {LocalTemperature(e, e.Room.Location.MaxY):0.0} °C)").AppendLine();
         sb.Append(c, $"Perish rate: {PerishRate(local):0.00}x (vanilla here: {PerishRate(VanillaClimate(e)):0.00}x)").AppendLine();
