@@ -31,6 +31,9 @@ namespace Caminus;
 /// </summary>
 public class EntityBehaviorCaminusBodyTemperature : EntityBehaviorBodyTemperature
 {
+    private const string ColdIdle = "coldidle";
+    private const string ColdIdleHeld = "coldidleheld";
+
     // Vanilla keeps all of this private (l.17-54). Re-declared, same names, same initial values.
     private ICoreAPI api = null!;
     private readonly EntityAgent? eagent;
@@ -194,9 +197,8 @@ public class EntityBehaviorCaminusBodyTemperature : EntityBehaviorBodyTemperatur
         if (num5 == 0f) num5 = Math.Max(num4 - bodyTemperatureResistance, 0f);
         float num6 = GameMath.Clamp(num5 / 6f, -6f, 6f);
 
-        // CAMINUS CHANGE 2. Vanilla l.266 is:
-        //     tempChange = nearHeatSourceStrength + (inEnclosedRoom ? 1f : -wind + num6);
-        // The flat +1/h is gone, so a room gets the same comfort term as the outdoors, computed on
+        // CAMINUS CHANGE 2. Vanilla l.266 adds a flat 1 per hour in any enclosed room instead of the
+        // comfort term, and subtracts the wind only outdoors. The flat +1/h is gone, so a room gets the same comfort term as the outdoors, computed on
         // its own air. The wind still only bites where vanilla let it: outside any enclosure.
         float wind = (float)Math.Max((windSpeedAt.Length() - 0.15) * 2.0, 0.0);
         tempChange = nearHeatSourceStrength + num6 - (inEnclosedRoom || tracked ? 0f : wind);
@@ -271,19 +273,19 @@ public class EntityBehaviorCaminusBodyTemperature : EntityBehaviorBodyTemperatur
         {
             if (flag)
             {
-                entity.StartAnimation("coldidleheld");
-                entity.StopAnimation("coldidle");
+                entity.StartAnimation(ColdIdleHeld);
+                entity.StopAnimation(ColdIdle);
             }
             else
             {
-                entity.StartAnimation("coldidle");
-                entity.StopAnimation("coldidleheld");
+                entity.StartAnimation(ColdIdle);
+                entity.StopAnimation(ColdIdleHeld);
             }
         }
-        else if (entity.AnimManager.IsAnimationActive("coldidle") || entity.AnimManager.IsAnimationActive("coldidleheld"))
+        else if (entity.AnimManager.IsAnimationActive(ColdIdle) || entity.AnimManager.IsAnimationActive(ColdIdleHeld))
         {
-            entity.StopAnimation("coldidle");
-            entity.StopAnimation("coldidleheld");
+            entity.StopAnimation(ColdIdle);
+            entity.StopAnimation(ColdIdleHeld);
         }
     }
 
