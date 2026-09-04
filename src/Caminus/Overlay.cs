@@ -9,20 +9,44 @@ using Vintagestory.API.Server;
 
 namespace Caminus;
 
-/// <summary>The HUD lines, already formatted server side. Empty text means hide the HUD.</summary>
+/// <summary>
+/// One puff the client is asked to spawn: a wall face blowing along its normal, or a chimney block
+/// letting the draft out. Everything the client needs is precomputed, so it only builds the particle.
+/// </summary>
+[ProtoContract]
+public sealed record ParticleFace
+{
+    [ProtoMember(1)] public int X { get; set; }
+    [ProtoMember(2)] public int Y { get; set; }
+    [ProtoMember(3)] public int Z { get; set; }
+    /// <summary><c>BlockFacing.Index</c> of the outward normal.</summary>
+    [ProtoMember(4)] public int Facing { get; set; }
+    /// <summary>What the face is doing, W, positive when heat leaves the room. 0 on a flue puff.</summary>
+    [ProtoMember(5)] public double Watts { get; set; }
+    /// <summary>Packed colour, already shaded by how loud the face is. Particles read it as BGRA.</summary>
+    [ProtoMember(6)] public int Color { get; set; }
+    /// <summary>Speed along the normal, m/s; negative flies the other way, i.e. into the room.</summary>
+    [ProtoMember(7)] public float Speed { get; set; }
+    /// <summary>A chimney puff rather than a wall face: same fields, another shape.</summary>
+    [ProtoMember(8)] public bool Flue { get; set; }
+}
+
+/// <summary>The HUD lines and the puffs, both formatted server side. Empty text means hide the HUD.</summary>
 [ProtoContract]
 public class OverlayPacket
 {
     [ProtoMember(1)] public string Text { get; set; } = "";
+    [ProtoMember(2)] public List<ParticleFace> Faces { get; set; } = [];
 }
 
 /// <summary>
 /// Draws the room a player stands in: one coloured cube per envelope block, particles along the
 /// loudest flows, three lines of numbers.
-/// The geometry never travels through a channel of ours. <c>IWorldAccessor.HighlightBlocks</c> and
-/// <c>SpawnParticles</c> are already server-to-client on the server side (ServerMain.cs:3359 and
-/// 3070 send their own packets), so the only thing left to send is the text, and a client that does
-/// not have Caminus installed still gets the colours and the flow.
+/// The geometry never travels through a channel of ours: <c>IWorldAccessor.HighlightBlocks</c> is
+/// already server-to-client on the server side (ServerMain.cs:3359 sends its own packet), so a
+/// client without Caminus still gets the cubes. The particles do travel, in the same packet as the
+/// text: <c>SpawnParticles</c> has no per-player form server side, and one player's overlay has no
+/// business showing up in another player's world.
 /// </summary>
 public class OverlayServer : ModSystem
 {
@@ -30,7 +54,7 @@ public class OverlayServer : ModSystem
     /// <summary>Block highlight slot the overlay draws in. Public so test harnesses can read it back.</summary>
     public const int HighlightSlot = 7;
     /// <summary>How many faces get flow particles, loudest first.</summary>
-    private const int ParticleFaces = 16;
+    private const int ParticleFaceCount = 16;
     /// <summary>Alpha of the quietest face, so that a wall doing nothing is still visible.</summary>
     private const double MinAlpha = 0.15;
 
@@ -83,10 +107,8 @@ public class OverlayServer : ModSystem
 
             (List<BlockPos> blocks, List<int> colors) = Highlights(flows);
             sapi.World.HighlightBlocks(player, HighlightSlot, blocks, colors);
-            SpawnFlowParticles(flows);
-            SpawnFlueParticles(flows);
             double? body = player.Entity.GetBehavior<EntityBehaviorCaminusBodyTemperature>()?.CurBodyTemperature;
-            channel.SendPacket(new OverlayPacket { Text = Describe(flows, pos.Y, body) }, player);
+            channel.SendPacket(new OverlayPacket { Text = Describe(flows, pos.Y, body), Faces = ParticleFaces(flows) }, player);
         }
     }
 
@@ -117,18 +139,29 @@ public class OverlayServer : ModSystem
         foreach (BlockPos p in flows.Draft?.Blocks ?? [])
         {
             blocks.Add(p);
-            colors.Add(ColorUtil.ColorFromRgba(255, 150, 30, (int)(255 * (flows.Draft!.Flow > 0 ? 0.75 : MinAlpha))));
+            colors.Add(ColorUtil.ColorFromRgba(FlueColor.R, FlueColor.G, FlueColor.B,
+                (int)(255 * (flows.Draft!.Flow > 0 ? 0.75 : MinAlpha))));
         }
         return (blocks, colors);
     }
+
+    /// <summary>
+    /// The face palette, RGB. Public so a scenario can name the colour it expects rather than repeat
+    /// three numbers: red heat leaving, blue heat coming in, brown buried, cyan an opening, orange the stack.
+    /// </summary>
+    public static readonly (int R, int G, int B)
+        OpeningLoss = (0, 220, 220), OpeningGain = (0, 150, 255),
+        GroundLoss = (170, 110, 40), GroundGain = (120, 90, 60),
+        WallLoss = (255, 50, 40), WallGain = (40, 90, 255),
+        FlueColor = (255, 150, 30);
 
     /// <summary>Red when heat leaves the room, blue when it comes in; brown when buried, cyan for an opening.</summary>
     private static (int R, int G, int B) Rgb(in FaceFlow f)
     {
         bool loss = f.Watts >= 0;
-        if (f.Face.Opening) return loss ? (0, 220, 220) : (0, 150, 255);
-        if (f.Face.Ground) return loss ? (170, 110, 40) : (120, 90, 60);
-        return loss ? (255, 50, 40) : (40, 90, 255);
+        if (f.Face.Opening) return loss ? OpeningLoss : OpeningGain;
+        if (f.Face.Ground) return loss ? GroundLoss : GroundGain;
+        return loss ? WallLoss : WallGain;
     }
 
     /// <summary>Share of the room's loudest face, floored so that every face stays on screen.</summary>
@@ -136,56 +169,43 @@ public class OverlayServer : ModSystem
         max <= 0 ? MinAlpha : Math.Clamp(Math.Abs(watts) / max, MinAlpha, 1);
 
     /// <summary>
-    /// A puff of quads over the middle of each of the loudest faces, moving along the face normal:
-    /// out of the room where heat leaves it, in where it comes back.
+    /// What the client is asked to spawn: a puff over the middle of each of the loudest faces moving
+    /// along the face normal (out of the room where heat leaves it, in where it comes back), then one
+    /// per chimney block, climbing as fast as the draft is strong.
+    /// Public and pure, same reason as <see cref="Highlights"/>.
     /// </summary>
-    // ponytail: the server has no per-player SpawnParticles, so a second player standing in the same
-    // room sees someone else's overlay. Put the top faces in OverlayPacket and spawn them client side
-    // if that ever bothers anyone.
-    private void SpawnFlowParticles(RoomFlows flows)
+    public static List<ParticleFace> ParticleFaces(RoomFlows flows)
     {
+        List<ParticleFace> puffs = [];
         double max = 0;
         foreach (FaceFlow f in flows.Faces) max = Math.Max(max, Math.Abs(f.Watts));
-        if (max <= 0) return;
-
-        foreach (FaceFlow f in flows.Faces.OrderByDescending(x => Math.Abs(x.Watts)).Take(ParticleFaces))
-        {
-            Vec3i n = f.Face.Facing.Normali;
-            // Face.Pos is the wall block and the air block is one step back along the normal, so the
-            // face plane sits at Pos + 0.5 - 0.5n; another 0.15 back puts the particles in the room.
-            var mid = new Vec3d(f.Face.Pos.X + 0.5 - 0.65 * n.X, f.Face.Pos.Y + 0.5 - 0.65 * n.Y, f.Face.Pos.Z + 0.5 - 0.65 * n.Z);
-            var spread = new Vec3d(0.3 * (1 - Math.Abs(n.X)), 0.3 * (1 - Math.Abs(n.Y)), 0.3 * (1 - Math.Abs(n.Z)));
-            float speed = (float)(0.15 + 0.45 * Math.Abs(f.Watts) / max) * (f.Watts >= 0 ? 1 : -1);
-            var velocity = new Vec3f(n.X * speed, n.Y * speed, n.Z * speed);
-            (int r, int g, int b) = Rgb(f);
-
-            sapi.World.SpawnParticles(new SimpleParticleProperties(2, 4,
-                // Particles read the colour as BGRA, walls as RGBA (ColorUtil.cs:275-281).
-                ColorUtil.ToRgba((int)(255 * Alpha(f.Watts, max)), r, g, b),
-                new Vec3d(mid.X - spread.X, mid.Y - spread.Y, mid.Z - spread.Z),
-                new Vec3d(mid.X + spread.X, mid.Y + spread.Y, mid.Z + spread.Z),
-                velocity, velocity, 1.2f, 0f, 0.15f, 0.3f, EnumParticleModel.Quad)
+        if (max > 0)
+            foreach (FaceFlow f in flows.Faces.OrderByDescending(x => Math.Abs(x.Watts)).Take(ParticleFaceCount))
             {
-                // A face particle starts a hand's width from a solid block and flies at it.
-                WithTerrainCollision = false,
-            });
-        }
-    }
-
-    /// <summary>Orange puffs climbing the stack, as fast as the draft is strong.</summary>
-    private void SpawnFlueParticles(RoomFlows flows)
-    {
-        if (flows.Draft is not { Flow: > 0 } draft) return;
+                (int r, int g, int b) = Rgb(f);
+                puffs.Add(new ParticleFace
+                {
+                    X = f.Face.Pos.X, Y = f.Face.Pos.Y, Z = f.Face.Pos.Z,
+                    Facing = f.Face.Facing.Index,
+                    Watts = f.Watts,
+                    // Particles read the colour as BGRA, walls as RGBA (ColorUtil.cs:275-281).
+                    Color = ColorUtil.ToRgba((int)(255 * Alpha(f.Watts, max)), r, g, b),
+                    Speed = (float)(0.15 + 0.45 * Math.Abs(f.Watts) / max) * (f.Watts >= 0 ? 1 : -1),
+                });
+            }
+        if (flows.Draft is not { Flow: > 0 } draft) return puffs;
         // A m³/s through a one-block flue IS a metre per second, so the flow per column is the speed.
-        var speed = new Vec3f(0, (float)Math.Min(3, draft.Flow / Math.Max(1, draft.Columns)), 0);
+        var up = (float)Math.Min(3, draft.Flow / Math.Max(1, draft.Columns));
         foreach (BlockPos p in draft.Blocks)
-            sapi.World.SpawnParticles(new SimpleParticleProperties(1, 2,
-                ColorUtil.ToRgba(180, 255, 150, 30),
-                new Vec3d(p.X + 0.35, p.Y + 0.2, p.Z + 0.35), new Vec3d(p.X + 0.65, p.Y + 0.4, p.Z + 0.65),
-                speed, speed, 1.5f, 0f, 0.2f, 0.4f, EnumParticleModel.Quad)
+            puffs.Add(new ParticleFace
             {
-                WithTerrainCollision = false,
+                X = p.X, Y = p.Y, Z = p.Z,
+                Facing = BlockFacing.UP.Index,
+                Color = ColorUtil.ToRgba(180, FlueColor.R, FlueColor.G, FlueColor.B),
+                Speed = up,
+                Flue = true,
             });
+        return puffs;
     }
 
     /// <summary>
@@ -228,7 +248,7 @@ public class OverlayServer : ModSystem
         Stratification.At(flows.Temperature, flows.Gradient, y, flows.YMid);
 }
 
-/// <summary>The hotkey and the text box. Everything else about the overlay is server side.</summary>
+/// <summary>The hotkey, the text box and the puffs. The room itself is measured server side.</summary>
 public class OverlayClient : ModSystem
 {
     private OverlayHud hud = null!;
@@ -241,12 +261,46 @@ public class OverlayClient : ModSystem
         api.Gui.RegisterDialog(hud);
         api.Network.RegisterChannel("caminus")
             .RegisterMessageType<OverlayPacket>()
-            .SetMessageHandler<OverlayPacket>(packet => hud.Set(packet.Text));
+            .SetMessageHandler<OverlayPacket>(packet =>
+            {
+                hud.Set(packet.Text);
+                foreach (ParticleFace f in packet.Faces) Spawn(api, f);
+            });
         // K is free in 1.22.7: no vanilla hotkey uses it, with or without a modifier.
         api.Input.RegisterHotKey("caminusoverlay", "Caminus thermal overlay", GlKeys.K, HotkeyType.HelpAndOverlays);
         // The rooms live on the server and it already has the command, so the key just types it.
         // That saves a second message type and lets /caminus overlay work from a vanilla client too.
         api.Input.SetHotKeyHandler("caminusoverlay", _ => { api.SendChatMessage("/caminus overlay"); return true; });
+    }
+
+    /// <summary>One puff, in this client's world only. Everything but the shape is already decided.</summary>
+    private static void Spawn(ICoreClientAPI api, ParticleFace f)
+    {
+        if (f.Flue)
+        {
+            var up = new Vec3f(0, f.Speed, 0);
+            api.World.SpawnParticles(new SimpleParticleProperties(1, 2, f.Color,
+                new Vec3d(f.X + 0.35, f.Y + 0.2, f.Z + 0.35), new Vec3d(f.X + 0.65, f.Y + 0.4, f.Z + 0.65),
+                up, up, 1.5f, 0f, 0.2f, 0.4f, EnumParticleModel.Quad)
+            {
+                WithTerrainCollision = false,
+            });
+            return;
+        }
+        Vec3i n = BlockFacing.ALLFACES[f.Facing].Normali;
+        // The wall block is at (X, Y, Z) and the air block is one step back along the normal, so the
+        // face plane sits at pos + 0.5 - 0.5n; another 0.15 back puts the particles in the room.
+        var mid = new Vec3d(f.X + 0.5 - 0.65 * n.X, f.Y + 0.5 - 0.65 * n.Y, f.Z + 0.5 - 0.65 * n.Z);
+        var spread = new Vec3d(0.3 * (1 - Math.Abs(n.X)), 0.3 * (1 - Math.Abs(n.Y)), 0.3 * (1 - Math.Abs(n.Z)));
+        var velocity = new Vec3f(n.X * f.Speed, n.Y * f.Speed, n.Z * f.Speed);
+        api.World.SpawnParticles(new SimpleParticleProperties(2, 4, f.Color,
+            new Vec3d(mid.X - spread.X, mid.Y - spread.Y, mid.Z - spread.Z),
+            new Vec3d(mid.X + spread.X, mid.Y + spread.Y, mid.Z + spread.Z),
+            velocity, velocity, 1.2f, 0f, 0.15f, 0.3f, EnumParticleModel.Quad)
+        {
+            // A face particle starts a hand's width from a solid block and flies at it.
+            WithTerrainCollision = false,
+        });
     }
 }
 

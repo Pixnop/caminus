@@ -99,136 +99,167 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Heated_stone_room_warms_up()
     {
-        BlockPos inside = await Room("CaminusWarm", 40, Stone);
-        LightFirepit(inside.Offset(0, -1, 0));
-        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusWarm", 40, Stone);
+        try
+        {
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
 
-        // Waiting on the source line, not just on the room: the room can already be tracked from an
-        // earlier tick and answer instantly with the scan that ran before the firepit was placed.
-        string before = await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W")); // 10 units × 400 W
+            // Waiting on the source line, not just on the room: the room can already be tracked from an
+            // earlier tick and answer instantly with the scan that ran before the firepit was placed.
+            string before = await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W")); // 10 units × 400 W
 
-        // The mod's step is in GAME seconds (realDt × SpeedOfTime × CalendarSpeedMul).
-        // GameCalendar.CalculateCurrentTimeSpeed SUMS the modifiers (it does not multiply
-        // them): the "baseGameSpeed" base is 60, +540 brings SpeedOfTime to 600, i.e. ×10.
-        // Without this, 10 real seconds would only be worth 300 game seconds and the rise
-        // would depend on Atlas's tick-pumping rate; with it, we have an order-of-magnitude margin.
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300); // ≈ 10 real seconds
+            // The mod's step is in GAME seconds (realDt × SpeedOfTime × CalendarSpeedMul).
+            // GameCalendar.CalculateCurrentTimeSpeed SUMS the modifiers (it does not multiply
+            // them): the "baseGameSpeed" base is 60, +540 brings SpeedOfTime to 600, i.e. ×10.
+            // Without this, 10 real seconds would only be worth 300 game seconds and the rise
+            // would depend on Atlas's tick-pumping rate; with it, we have an order-of-magnitude margin.
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300); // ≈ 10 real seconds
 
-        string after = await ReportAt(inside);
-        double t0 = Read(RoomTemp(), before), t1 = Read(RoomTemp(), after);
-        Assert.True(t1 - t0 >= 2.0, $"the room only gained {t1 - t0:0.00} K\nbefore:\n{before}\nafter:\n{after}");
-        Assert.Contains("Sources: 4000 W", after);
+            string after = await ReportAt(inside);
+            double t0 = Read(RoomTemp(), before), t1 = Read(RoomTemp(), after);
+            Assert.True(t1 - t0 >= 2.0, $"the room only gained {t1 - t0:0.00} K\nbefore:\n{before}\nafter:\n{after}");
+            Assert.Contains("Sources: 4000 W", after);
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Glass_pane_replaces_a_stone_face()
     {
-        BlockPos inside = await Room("CaminusPane", 80, Stone);
-        string stone = await WaitForRoomReport(inside);
-        Assert.DoesNotContain("Openings", stone);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusPane", 80, Stone);
+        try
+        {
+            string stone = await WaitForRoomReport(inside);
+            Assert.DoesNotContain("Openings", stone);
 
-        // One wall face replaced with a glass pane: still an enclosed room for the vanilla
-        // registry (the pane retains heat across its plane) and a Glass wall for Caminus
-        // (5 W/K instead of 3 W/K for stone, i.e. +2 W/K).
-        World.SetBlock(Pane, inside.Offset(0, 0, -2));
-        string glazed = await WaitForRoomReport(inside, r => r.Contains("Glass: 1 faces"));
+            // One wall face replaced with a glass pane: still an enclosed room for the vanilla
+            // registry (the pane retains heat across its plane) and a Glass wall for Caminus
+            // (5 W/K instead of 3 W/K for stone, i.e. +2 W/K).
+            World.SetBlock(Pane, inside.Offset(0, 0, -2));
+            string glazed = await WaitForRoomReport(inside, r => r.Contains("Glass: 1 faces"));
 
-        Assert.Contains("Stone: 53 faces", glazed);
-        Assert.DoesNotContain("Openings", glazed);
-        double gain = Read(Losses(), glazed) - Read(Losses(), stone);
-        Assert.True(Math.Abs(gain - 2.0) < 0.1, $"conductance +{gain:0.0} W/K instead of +2\nstone:\n{stone}\nglazed:\n{glazed}");
+            Assert.Contains("Stone: 53 faces", glazed);
+            Assert.DoesNotContain("Openings", glazed);
+            double gain = Read(Losses(), glazed) - Read(Losses(), stone);
+            Assert.True(Math.Abs(gain - 2.0) < 0.1, $"conductance +{gain:0.0} W/K instead of +2\nstone:\n{stone}\nglazed:\n{glazed}");
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Open_air_is_not_a_room()
     {
         ITestPlayer player = await World.JoinPlayer("CaminusOutside");
-        await player.TeleportTo(World.Spawn.Offset(200, 0, 40));
-        await World.Ticks(90); // three mod ticks
-        Assert.Contains("No enclosed room here.", await ReportAt(player.Position));
+        try
+        {
+            await player.TeleportTo(World.Spawn.Offset(200, 0, 40));
+            await World.Ticks(90); // three mod ticks
+            Assert.Contains("No enclosed room here.", await ReportAt(player.Position));
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Wood_walls_leak_less_than_stone()
     {
-        BlockPos stone = await Room("CaminusStone", 120, Stone);
-        BlockPos wood = await Room("CaminusWood", 160, Wood);
+        (ITestPlayer stonePlayer, BlockPos stone) = await RoomAndPlayer("CaminusStone", 120, Stone);
+        (ITestPlayer woodPlayer, BlockPos wood) = await RoomAndPlayer("CaminusWood", 160, Wood);
+        try
+        {
+            string stoneReport = await WaitForRoomReport(stone);
+            string woodReport = await WaitForRoomReport(wood);
 
-        string stoneReport = await WaitForRoomReport(stone);
-        string woodReport = await WaitForRoomReport(wood);
-
-        Assert.Contains("Stone: 54 faces", stoneReport);
-        Assert.Contains("Wood: 54 faces", woodReport);
-        Assert.True(Read(Losses(), woodReport) < Read(Losses(), stoneReport),
-            $"stone:\n{stoneReport}\nwood:\n{woodReport}");
+            Assert.Contains("Stone: 54 faces", stoneReport);
+            Assert.Contains("Wood: 54 faces", woodReport);
+            Assert.True(Read(Losses(), woodReport) < Read(Losses(), stoneReport),
+                $"stone:\n{stoneReport}\nwood:\n{woodReport}");
+        }
+        finally
+        {
+            await Leave(stonePlayer);
+            await Leave(woodPlayer);
+        }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Buried_room_has_a_ground_node()
     {
-        BlockPos inside = await Cellar("CaminusCellar", 240);
-        string report = await WaitForRoomReport(inside, r => r.Contains("Ground walls:"));
+        (ITestPlayer player, BlockPos inside) = await Cellar("CaminusCellar", 240);
+        try
+        {
+            string report = await WaitForRoomReport(inside, r => r.Contains("Ground walls:"));
 
-        // Interior at Y 1..3 with the worldgen surface at 2: the 9 floor faces (2 m down) and the
-        // 12 side faces of the bottom layer (1 m down) are buried, the other 33 face the open air.
-        Assert.Contains("Outside walls:\n  Stone: 33 faces", report.ReplaceLineEndings("\n"));
-        Assert.Contains("Ground walls:\n  Stone: 21 faces", report.ReplaceLineEndings("\n"));
-        Assert.Contains("at 1.4 m", report); // (9 × 2 + 12 × 1) / 21
+            // Interior at Y 1..3 with the worldgen surface at 2: the 9 floor faces (2 m down) and the
+            // 12 side faces of the bottom layer (1 m down) are buried, the other 33 face the open air.
+            Assert.Contains("Outside walls:\n  Stone: 33 faces", report.ReplaceLineEndings("\n"));
+            Assert.Contains("Ground walls:\n  Stone: 21 faces", report.ReplaceLineEndings("\n"));
+            Assert.Contains("at 1.4 m", report); // (9 × 2 + 12 × 1) / 21
 
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300); // about two time constants: 27 m³ × 6030 J/K/m³ over 120 W/K
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300); // about two time constants: 27 m³ × 6030 J/K/m³ over 120 W/K
 
-        string after = await ReportAt(inside);
-        double ground = Read(GroundTemp(), after), outside = Read(OutsideTemp(), after), t = Read(RoomTemp(), after);
-        // The ground node ignores the diurnal swing entirely, so it is almost never equal to the
-        // outside temperature; the room settles on the conductance-weighted mix of the two.
-        Assert.True(Math.Abs(outside - ground) > 1, $"no signal to measure: outside and ground agree\n{after}");
-        double equilibrium = (33 * 3.0 * outside + 21 * 1.0 * ground) / (33 * 3.0 + 21 * 1.0);
-        Assert.True(Math.Abs(t - equilibrium) < 1, $"cellar at {t:0.0} °C, expected about {equilibrium:0.0} °C\n{after}");
-        Assert.True(Math.Abs(t - outside) > 0.1, $"the ground node pulled the cellar nowhere\n{after}");
+            string after = await ReportAt(inside);
+            double ground = Read(GroundTemp(), after), outside = Read(OutsideTemp(), after), t = Read(RoomTemp(), after);
+            // The ground node ignores the diurnal swing entirely, so it is almost never equal to the
+            // outside temperature; the room settles on the conductance-weighted mix of the two.
+            Assert.True(Math.Abs(outside - ground) > 1, $"no signal to measure: outside and ground agree\n{after}");
+            double equilibrium = (33 * 3.0 * outside + 21 * 1.0 * ground) / (33 * 3.0 + 21 * 1.0);
+            Assert.True(Math.Abs(t - equilibrium) < 1, $"cellar at {t:0.0} °C, expected about {equilibrium:0.0} °C\n{after}");
+            Assert.True(Math.Abs(t - outside) > 0.1, $"the ground node pulled the cellar nowhere\n{after}");
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Perish_rate_follows_room_temperature()
     {
-        BlockPos inside = await Room("CaminusPerish", 280, Stone);
-        BlockPos chest = inside.Offset(1, -1, 0);
-        // A chest is sidesolid: false on every face, so the vanilla flood fill runs straight through
-        // it and the block stays part of the room. No food needed: GetPerishRate ignores the contents.
-        World.SetBlock("game:chest-east", chest);
-        LightFirepit(inside.Offset(0, -1, 0));
-        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusPerish", 280, Stone);
+        try
+        {
+            BlockPos chest = inside.Offset(1, -1, 0);
+            // A chest is sidesolid: false on every face, so the vanilla flood fill runs straight through
+            // it and the block stays part of the room. No food needed: GetPerishRate ignores the contents.
+            World.SetBlock("game:chest-east", chest);
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
 
-        // The report is read AT THE CHEST, not at eye height: the perish rate now follows the air at
-        // the container's own height, and the firepit puts 1.6 K/m between the two.
-        string before = await WaitForRoomReport(chest, r => r.Contains("Perish rate:"));
-        double reported = Read(PerishRate(), before);
-        Assert.Equal(reported, ContainerPerishRate(chest), 2); // the postfix is live, not just our report
+            // The report is read AT THE CHEST, not at eye height: the perish rate now follows the air at
+            // the container's own height, and the firepit puts 1.6 K/m between the two.
+            string before = await WaitForRoomReport(chest, r => r.Contains("Perish rate:"));
+            double reported = Read(PerishRate(), before);
+            Assert.Equal(reported, ContainerPerishRate(chest), 2); // the postfix is live, not just our report
 
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
 
-        string after = await ReportAt(chest);
-        double heated = Read(PerishRate(), after);
-        Assert.True(heated > reported, $"perish rate went {reported:0.000} -> {heated:0.000}\nbefore:\n{before}\nafter:\n{after}");
-        Assert.Equal(heated, ContainerPerishRate(chest), 2);
+            string after = await ReportAt(chest);
+            double heated = Read(PerishRate(), after);
+            Assert.True(heated > reported, $"perish rate went {reported:0.000} -> {heated:0.000}\nbefore:\n{before}\nafter:\n{after}");
+            Assert.Equal(heated, ContainerPerishRate(chest), 2);
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Stratification_makes_the_ceiling_warmer_than_the_floor()
     {
-        BlockPos inside = await Room("CaminusStrat", 320, Stone);
-        LightFirepit(inside.Offset(0, -1, 0));
-        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusStrat", 320, Stone);
+        try
+        {
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
 
-        // 4000 W of firepit x 0.4 K/m/kW = 1.6 K/m, and the interior is 3 blocks tall, so the floor
-        // and the ceiling sit 1 m either side of the mean: 3.2 K apart.
-        string report = await WaitForRoomReport(inside, r => r.Contains("Stratification: 1.6 K/m"));
-        double floor = Read(FloorTemp(), report), ceiling = Read(CeilingTemp(), report);
-        Assert.True(ceiling - floor > 3.0, $"ceiling {ceiling:0.0} °C, floor {floor:0.0} °C\n{report}");
-        Assert.True(Math.Abs(ceiling + floor - 2 * Read(RoomTemp(), report)) < 0.15,
-            $"the mean should sit halfway between the two\n{report}");
+            // 4000 W of firepit x 0.4 K/m/kW = 1.6 K/m, and the interior is 3 blocks tall, so the floor
+            // and the ceiling sit 1 m either side of the mean: 3.2 K apart.
+            string report = await WaitForRoomReport(inside, r => r.Contains("Stratification: 1.6 K/m"));
+            double floor = Read(FloorTemp(), report), ceiling = Read(CeilingTemp(), report);
+            Assert.True(ceiling - floor > 3.0, $"ceiling {ceiling:0.0} °C, floor {floor:0.0} °C\n{report}");
+            Assert.True(Math.Abs(ceiling + floor - 2 * Read(RoomTemp(), report)) < 0.15,
+                $"the mean should sit halfway between the two\n{report}");
+        }
+        finally { await Leave(player); }
     }
 
     /// <summary>
@@ -242,63 +273,75 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Wind_increases_losses()
     {
-        BlockPos inside = await Room("CaminusWind", 360, Stone);
-        await WaitForRoomReport(inside);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusWind", 360, Stone);
+        try
+        {
+            await WaitForRoomReport(inside);
 
-        string calm = await WindReport(inside, "still", r => WindBelow(r, 0.05));
-        double calmSpeed = Read(WindSpeed(), calm);
-        string windy = await WindReport(inside, "storm", r => !WindBelow(r, Math.Max(0.05, 3 * calmSpeed)));
-        SetWindPattern("still"); // the world is shared with the other scenarios of this class
+            string calm = await WindReport(inside, "still", r => WindBelow(r, 0.05));
+            double calmSpeed = Read(WindSpeed(), calm);
+            string windy = await WindReport(inside, "storm", r => !WindBelow(r, Math.Max(0.05, 3 * calmSpeed)));
+            SetWindPattern("still"); // the world is shared with the other scenarios of this class
 
-        Assert.True(Read(WindSpeed(), windy) > 0.5, $"a storm should blow hard\ncalm:\n{calm}\nwindy:\n{windy}");
-        // Wind blows toward +X, i.e. from the west, onto the 9 faces of the east wall:
-        // 9 x 3 W/K x windWallFactor 2 x speed, against 162 W/K of calm envelope, so about +40 %
-        // at a storm's 1.2.
-        Assert.Contains("from the west", windy);
-        Assert.True(Read(WindLosses(), windy) > Read(WindLosses(), calm) + 5,
-            $"the storm barely cost anything\ncalm:\n{calm}\nwindy:\n{windy}");
-        // Losses stays the fabric of the building: the wind's share is on the Wind line only.
-        Assert.Equal(Read(Losses(), calm), Read(Losses(), windy), 1);
+            Assert.True(Read(WindSpeed(), windy) > 0.5, $"a storm should blow hard\ncalm:\n{calm}\nwindy:\n{windy}");
+            // Wind blows toward +X, i.e. from the west, onto the 9 faces of the east wall:
+            // 9 x 3 W/K x windWallFactor 2 x speed, against 162 W/K of calm envelope, so about +40 %
+            // at a storm's 1.2.
+            Assert.Contains("from the west", windy);
+            Assert.True(Read(WindLosses(), windy) > Read(WindLosses(), calm) + 5,
+                $"the storm barely cost anything\ncalm:\n{calm}\nwindy:\n{windy}");
+            // Losses stays the fabric of the building: the wind's share is on the Wind line only.
+            Assert.Equal(Read(Losses(), calm), Read(Losses(), windy), 1);
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Room_keeps_living_without_a_player()
     {
         (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusAlone", 400, Stone);
-        LightFirepit(inside.Offset(0, -1, 0));
-        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
-        string before = await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
+        try
+        {
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+            string before = await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
 
-        // 60 blocks away and back on the ground: outside the room, but well within the server view
-        // distance (the join log reports 128), so the chunk column holding the room stays loaded.
-        await player.TeleportTo(World.Spawn.Offset(460, 0, 40));
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300);
+            // 60 blocks away and back on the ground: outside the room, but well within the server view
+            // distance (the join log reports 128), so the chunk column holding the room stays loaded.
+            await player.TeleportTo(World.Spawn.Offset(460, 0, 40));
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
 
-        string after = await ReportAt(inside);
-        Assert.Contains("Sources: 4000 W", after); // the 10-tick scan of an empty room still sees the fire
-        double gain = Read(RoomTemp(), after) - Read(RoomTemp(), before);
-        Assert.True(gain >= 2.0, $"the empty room only gained {gain:0.00} K\nbefore:\n{before}\nafter:\n{after}");
+            string after = await ReportAt(inside);
+            Assert.Contains("Sources: 4000 W", after); // the 10-tick scan of an empty room still sees the fire
+            double gain = Read(RoomTemp(), after) - Read(RoomTemp(), before);
+            Assert.True(gain >= 2.0, $"the empty room only gained {gain:0.00} K\nbefore:\n{before}\nafter:\n{after}");
+        }
+        finally { await Leave(player); }
     }
 
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Unvisited_room_is_discovered_by_its_container()
     {
         ITestPlayer player = await World.JoinPlayer("CaminusCrock");
-        BlockPos min = World.Spawn.Offset(440, 30, 40);
-        await player.TeleportTo(World.Spawn.Offset(440, 0, 40));
-        await WaitForShellChunks(min);
-        Build(min, Stone);
+        try
+        {
+            BlockPos min = World.Spawn.Offset(440, 30, 40);
+            await player.TeleportTo(World.Spawn.Offset(440, 0, 40));
+            await WaitForShellChunks(min);
+            Build(min, Stone);
 
-        BlockPos chest = min.Offset(1, 1, 1);
-        World.SetBlock("game:chest-east", chest);
-        await World.Ticks(90); // three mod ticks: no player ever set foot in there
-        Assert.Contains("No enclosed room here.", await ReportAt(chest));
+            BlockPos chest = min.Offset(1, 1, 1);
+            World.SetBlock("game:chest-east", chest);
+            await World.Ticks(90); // three mod ticks: no player ever set foot in there
+            Assert.Contains("No enclosed room here.", await ReportAt(chest));
 
-        // Exactly what the container calls on its own 10 s tick, through the Harmony postfix.
-        // Calling it here instead of waiting for that tick keeps the scenario 10 s shorter.
-        ContainerPerishRate(chest);
-        Assert.Contains("Room:", await ReportAt(chest));
+            // Exactly what the container calls on its own 10 s tick, through the Harmony postfix.
+            // Calling it here instead of waiting for that tick keeps the scenario 10 s shorter.
+            ContainerPerishRate(chest);
+            Assert.Contains("Room:", await ReportAt(chest));
+        }
+        finally { await Leave(player); }
     }
 
     /// <summary>
@@ -309,36 +352,40 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Overlay_describes_the_room()
     {
-        BlockPos inside = await Room("CaminusOverlay", 480, Stone);
-        LightFirepit(inside.Offset(0, -1, 0));
-        await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
-        await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusOverlay", 480, Stone);
+        try
+        {
+            LightFirepit(inside.Offset(0, -1, 0));
+            await World.Until(() => Firepit(inside.Offset(0, -1, 0))?.IsBurning == true);
+            await WaitForRoomReport(inside, r => r.Contains("Sources: 4000 W"));
 
-        // About three time constants (27 m³ x 6030 J/K/m³ over 162 W/K), so the room settles near
-        // its 4000 W / 162 W/K = +25 K equilibrium and every face, floor included, loses heat.
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300);
-        // The Losses line is the calm envelope only, the faces also carry the wind: compare the two
-        // on a still day, where the wind is worth under 2 % of a 162 W/K box.
-        string report = await WindReport(inside, "still", r => WindBelow(r, 0.05));
+            // About three time constants (27 m³ x 6030 J/K/m³ over 162 W/K), so the room settles near
+            // its 4000 W / 162 W/K = +25 K equilibrium and every face, floor included, loses heat.
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
+            // The Losses line is the calm envelope only, the faces also carry the wind: compare the two
+            // on a still day, where the wind is worth under 2 % of a 162 W/K box.
+            string report = await WindReport(inside, "still", r => WindBelow(r, 0.05));
 
-        RoomThermalSystem thermal = World.Api.ModLoader.GetModSystem<RoomThermalSystem>();
-        Assert.True(thermal.TryGetFaceFlows(inside, out RoomFlows? flows), report);
-        Assert.Equal(54, flows!.Faces.Count);
-        Assert.True(flows.Temperature > flows.OutsideTemperature + 5,
-            $"the firepit barely warmed the room, nothing to look at\n{report}");
-        Assert.DoesNotContain(flows.Faces, f => f.Watts <= 0);
+            RoomThermalSystem thermal = World.Api.ModLoader.GetModSystem<RoomThermalSystem>();
+            Assert.True(thermal.TryGetFaceFlows(inside, out RoomFlows? flows), report);
+            Assert.Equal(54, flows!.Faces.Count);
+            Assert.True(flows.Temperature > flows.OutsideTemperature + 5,
+                $"the firepit barely warmed the room, nothing to look at\n{report}");
+            Assert.DoesNotContain(flows.Faces, f => f.Watts <= 0);
 
-        // The Losses line is the fabric against the outside air; each face also sees whatever sun falls
-        // on it, which is the same Sun line the report prints, so the two still have to add up.
-        double sum = flows.Faces.Sum(f => f.Watts), losses = Read(LossWatts(), report) - SunOf(report);
-        Assert.True(Math.Abs(sum - losses) < 0.05 * losses,
-            $"the faces add up to {sum:0} W, the report says {losses:0} W\n{report}");
+            // The Losses line is the fabric against the outside air; each face also sees whatever sun falls
+            // on it, which is the same Sun line the report prints, so the two still have to add up.
+            double sum = flows.Faces.Sum(f => f.Watts), losses = Read(LossWatts(), report) - SunOf(report);
+            Assert.True(Math.Abs(sum - losses) < 0.05 * losses,
+                $"the faces add up to {sum:0} W, the report says {losses:0} W\n{report}");
 
-        (List<BlockPos> blocks, List<int> colors) = OverlayServer.Highlights(flows);
-        Assert.Equal(54, blocks.Count);
-        Assert.Equal(blocks.Count, colors.Count);
-        Assert.StartsWith("Room ", OverlayServer.Describe(flows, inside.Y));
+            (List<BlockPos> blocks, List<int> colors) = OverlayServer.Highlights(flows);
+            Assert.Equal(54, blocks.Count);
+            Assert.Equal(blocks.Count, colors.Count);
+            Assert.StartsWith("Room ", OverlayServer.Describe(flows, inside.Y));
+        }
+        finally { await Leave(player); }
     }
 
     /// <summary>
@@ -351,33 +398,41 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Lava_under_the_floor_heats_the_cellar_through_rock()
     {
-        BlockPos control = await Room("CaminusNoLava", 520, Stone);
-        BlockPos heated = await Room("CaminusLava", 560, Stone);
-        await WaitForRoomReport(control);
-        await WaitForRoomReport(heated);
+        (ITestPlayer controlPlayer, BlockPos control) = await RoomAndPlayer("CaminusNoLava", 520, Stone);
+        (ITestPlayer heatedPlayer, BlockPos heated) = await RoomAndPlayer("CaminusLava", 560, Stone);
+        try
+        {
+            await WaitForRoomReport(control);
+            await WaitForRoomReport(heated);
 
-        // The pocket crosses a chunk boundary below the box: wait for that chunk too, or SetBlock is a no-op.
-        BlockPos lava = heated.Offset(0, -5, 0);
-        await World.Until(() => World.Api.World.BlockAccessor.GetChunkAtBlockPos(lava.Offset(0, -1, 0)) != null, 1200);
-        // Lava spreads: it only stays put walled in on all six sides.
-        for (int x = -1; x <= 1; x++)
-            for (int y = -1; y <= 1; y++)
-                for (int z = -1; z <= 1; z++)
-                    World.SetBlock(Stone, lava.Offset(x, y, z));
-        World.SetBlock("game:lava-still-7", lava);
+            // The pocket crosses a chunk boundary below the box: wait for that chunk too, or SetBlock is a no-op.
+            BlockPos lava = heated.Offset(0, -5, 0);
+            await World.Until(() => World.Api.World.BlockAccessor.GetChunkAtBlockPos(lava.Offset(0, -1, 0)) != null, 1200);
+            // Lava spreads: it only stays put walled in on all six sides.
+            for (int x = -1; x <= 1; x++)
+                for (int y = -1; y <= 1; y++)
+                    for (int z = -1; z <= 1; z++)
+                        World.SetBlock(Stone, lava.Offset(x, y, z));
+            World.SetBlock("game:lava-still-7", lava);
 
-        string report = await WaitForRoomReport(heated, r => NearbyWatts().IsMatch(r));
-        Assert.Contains("Sources: 1200 W (nearby 1200 W)", report);
+            string report = await WaitForRoomReport(heated, r => NearbyWatts().IsMatch(r));
+            Assert.Contains("Sources: 1200 W (nearby 1200 W)", report);
 
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
-        await World.Ticks(300);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
 
-        string warm = await ReportAt(heated), cold = await ReportAt(control);
-        // 1200 W over a 162 W/K stone box is +7.4 K at equilibrium; the two boxes are 40 blocks apart
-        // at the same height, so they share their climate, their wind and their sun.
-        double gain = Read(RoomTemp(), warm) - Read(RoomTemp(), cold);
-        Assert.True(gain > 1.0, $"the lava is worth {gain:0.00} K\nlava:\n{warm}\ncontrol:\n{cold}");
-        Assert.DoesNotContain("nearby", cold);
+            string warm = await ReportAt(heated), cold = await ReportAt(control);
+            // 1200 W over a 162 W/K stone box is +7.4 K at equilibrium; the two boxes are 40 blocks apart
+            // at the same height, so they share their climate, their wind and their sun.
+            double gain = Read(RoomTemp(), warm) - Read(RoomTemp(), cold);
+            Assert.True(gain > 1.0, $"the lava is worth {gain:0.00} K\nlava:\n{warm}\ncontrol:\n{cold}");
+            Assert.DoesNotContain("nearby", cold);
+        }
+        finally
+        {
+            await Leave(controlPlayer);
+            await Leave(heatedPlayer);
+        }
     }
 
     /// <summary>
@@ -387,19 +442,23 @@ public partial class ThermalScenarios : AtlasScenarioBase
     [AtlasScenario(TimeoutMs = 180_000)]
     public async Task Sun_warms_the_roof_by_day()
     {
-        BlockPos inside = await Room("CaminusSun", 600, Stone);
-        await WaitForRoomReport(inside);
-        // Back to real time: the polling below must not drag the clock across sunrise.
-        World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusSun", 600, Stone);
+        try
+        {
+            await WaitForRoomReport(inside);
+            // Back to real time: the polling below must not drag the clock across sunrise.
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
 
-        // The 9 roof faces take the sun's noon height and the walls it shines on take the horizontal
-        // cosine of incidence, so the exact wattage moves with the season and the latitude.
-        string noon = await ReportAtHour(inside, 12, r => SunOf(r) > 0);
-        Assert.True(SunOf(noon) > 0, $"no sun at noon\n{noon}");
+            // The 9 roof faces take the sun's noon height and the walls it shines on take the horizontal
+            // cosine of incidence, so the exact wattage moves with the season and the latitude.
+            string noon = await ReportAtHour(inside, 12, r => SunOf(r) > 0);
+            Assert.True(SunOf(noon) > 0, $"no sun at noon\n{noon}");
 
-        string night = await ReportAtHour(inside, 0, r => SunOf(r) == 0);
-        Assert.Equal(0, SunOf(night));
-        Assert.Contains("Sun: 0.0 (", night);
+            string night = await ReportAtHour(inside, 0, r => SunOf(r) == 0);
+            Assert.Equal(0, SunOf(night));
+            Assert.Contains("Sun: 0.0 (", night);
+        }
+        finally { await Leave(player); }
     }
 
     /// <summary>Winds the calendar forward to the next occurrence of that hour, then polls the report.</summary>
@@ -431,7 +490,7 @@ public partial class ThermalScenarios : AtlasScenarioBase
     /// with the player inside. Atlas's superflat world only has terrain down to Y 0, so the cellar
     /// ends up half buried: exactly what makes it interesting, both wall groups show up at once.
     /// </summary>
-    private async Task<BlockPos> Cellar(string playerName, int dx)
+    private async Task<(ITestPlayer Player, BlockPos Pos)> Cellar(string playerName, int dx)
     {
         ITestPlayer player = await World.JoinPlayer(playerName);
         BlockPos surface = World.Spawn.Offset(dx, 0, 40);
@@ -446,7 +505,7 @@ public partial class ThermalScenarios : AtlasScenarioBase
 
         BlockPos center = min.Offset(1, 1, 1);
         await player.TeleportTo(center);
-        return center;
+        return (player, center);
     }
 
     private double ContainerPerishRate(BlockPos pos)
@@ -456,13 +515,10 @@ public partial class ThermalScenarios : AtlasScenarioBase
     }
 
     /// <summary>
-    /// Joins a player, builds a hollow box far from spawn and 30 blocks above ground,
-    /// and teleports the player into it (a player standing in a room is how the mod finds it).
-    /// Returns the center interior position.
+    /// Joins a player, builds a hollow box far from spawn and 30 blocks above ground, and teleports
+    /// the player into it (a player standing in a room is how the mod finds it). Returns both: the
+    /// caller owes the player a <see cref="Leave"/>, the box only needs its center interior position.
     /// </summary>
-    private async Task<BlockPos> Room(string playerName, int dx, string wall) =>
-        (await RoomAndPlayer(playerName, dx, wall)).Pos;
-
     private async Task<(ITestPlayer Player, BlockPos Pos)> RoomAndPlayer(string playerName, int dx, string wall)
     {
         ITestPlayer player = await World.JoinPlayer(playerName);
@@ -710,12 +766,16 @@ public partial class ThermalScenarios : AtlasScenarioBase
     }
 
     /// <summary>
-    /// Frees the client slot. The embedded server accepts 16 clients and no queue, test players
-    /// never leave on their own, and this class is already close to the cap: the three players the
-    /// body temperature scenarios need have to hand their seats back.
+    /// Frees the client slot. The embedded server accepts 16 clients and no queue, test players never
+    /// leave on their own, and xUnit gives no intra-class ordering: every scenario here joins its
+    /// players inside a try and hands the seats back in the finally, so the peak is what the busiest
+    /// single scenario needs (two) rather than the sum of the whole class.
     /// </summary>
     private async Task Leave(ITestPlayer player)
     {
+        // Printed before the disconnect, so the run log carries how close each scenario came to the cap.
+        Console.WriteLine($"[Caminus] {player.Player.PlayerName} leaves, " +
+                          $"{World.Api.World.AllOnlinePlayers.Length} players online");
         ((Vintagestory.API.Server.IServerPlayer)player.Player).Disconnect("scenario over");
         await World.Until(() => !player.IsConnected, 600);
     }
@@ -977,6 +1037,10 @@ public partial class ThermalScenarios : AtlasScenarioBase
             // colours below mean anything (red is "heat leaving", blue would be heat coming in).
             World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
             await World.Ticks(300);
+            // Back to the normal clock before anything is compared: the assertions below read the
+            // packet and the model a moment apart, and a sky racing across the map moves the sun-warmed
+            // faces between the two.
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
 
             player.Client.Clear();
             // The command's answer never becomes a chat line here: a real client's message goes through
@@ -1009,14 +1073,25 @@ public partial class ThermalScenarios : AtlasScenarioBase
             Assert.StartsWith("Room ", texts[^1].Text);
             Assert.Contains("outside", texts[^1].Text);
 
-            // Particles only reach a player whose chunk at the spawn position is streamed, and the
-            // overlay spawns them on every tick, so this is a wait rather than a single read.
-            await World.Until(() => player.Client.Particles().Count > 0, 300);
-            IReadOnlyList<SpawnedParticles> puffs = player.Client.Particles();
-            Assert.Contains(puffs, p => p.Rgba.R == 255 && p.Rgba.R > p.Rgba.B);
-            var center = new Vec3d(inside.X + 0.5, inside.Y + 0.5, inside.Z + 0.5);
-            Assert.All(puffs, p => Assert.True(p.Position.DistanceTo(center) < 4,
-                $"a puff spawned at {p.Position}, {p.Position.DistanceTo(center):0.0} blocks from the room"));
+            // The puffs are spawned by OverlayClient now, so no particle packet travels at all: they
+            // ride the overlay packet as faces, on this player's connection only. Client.Particles()
+            // is therefore empty, and the assertion moved onto what the packet asks the client to draw.
+            Assert.Empty(player.Client.Particles());
+            List<ParticleFace> expected = OverlayServer.ParticleFaces(flows!);
+            Assert.Equal(16, expected.Count); // the loudest 16 of the 54 faces; no chimney on this box
+            Assert.Equal(expected.Count, texts[^1].Faces.Count);
+            // WHICH sixteen is deliberately not compared: the cut falls inside a group of twelve wall
+            // faces that the wind separates by a fraction of a watt, and the packet is always a mod
+            // tick older than the flows read above, so the last few swap places between the two. What
+            // has to hold is that every puff is a real face of this very room, and each of them once.
+            HashSet<(int, int, int, int)> envelope = [.. flows!.Faces
+                .Select(f => (f.Face.Pos.X, f.Face.Pos.Y, f.Face.Pos.Z, f.Face.Facing.Index))];
+            List<(int, int, int, int)> sent = [.. texts[^1].Faces.Select(f => (f.X, f.Y, f.Z, f.Facing))];
+            Assert.Equal(sent.Count, sent.Distinct().Count());
+            Assert.All(sent, f => Assert.Contains(f, envelope));
+            // Every face of this room loses heat, so every puff flies out of it.
+            Assert.All(texts[^1].Faces, f => Assert.True(f.Watts > 0 && f.Speed > 0,
+                $"the face at {f.X},{f.Y},{f.Z} carries {f.Watts:0} W at speed {f.Speed}"));
 
             // Two more mod ticks with nobody reading, so the timed read below pays for a real drain
             // (every read decodes whatever arrived since the previous one, so a read right after a
@@ -1029,19 +1104,203 @@ public partial class ThermalScenarios : AtlasScenarioBase
             int packets = player.Client.Packets<OverlayPacket>("caminus").Count;
             Console.WriteLine($"[Caminus] client observations: Highlights({seen} cubes) {highlightMs:0.00} ms, " +
                               $"Packets<OverlayPacket>({packets}) {clock.Elapsed.TotalMilliseconds:0.00} ms, " +
-                              $"{puffs.Count} particle spawns, {player.Client.ChatLines().Count} chat lines");
+                              $"{expected.Count} puffs per packet, {player.Client.ChatLines().Count} chat lines");
 
             // Off: the mod clears the slot and sends an empty text, and the empty highlight packet is
             // exactly how a slot is cleared client side.
             await player.Say("/caminus overlay");
             Assert.Contains(player.Client.ChatLines(), line => line.Contains("Thermal overlay off."));
             await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count == 0, 300);
-            Assert.Equal("", player.Client.Packets<OverlayPacket>("caminus")[^1].Text);
+            OverlayPacket last = player.Client.Packets<OverlayPacket>("caminus")[^1];
+            Assert.Equal("", last.Text);
+            Assert.Empty(last.Faces); // nothing left for the client to draw either
 
             player.Client.Clear();
             Assert.Empty(player.Client.Highlights(OverlayServer.HighlightSlot));
             Assert.Empty(player.Client.Packets<OverlayPacket>("caminus"));
             Assert.Empty(player.Client.Particles());
+        }
+        finally { await Leave(player); }
+    }
+
+    /// <summary>
+    /// The whole palette on one room, read off the cubes the player actually received. A half-buried
+    /// cellar is where every colour shows up at once: the floor and the bottom course of walls are
+    /// ground faces, the two courses above the worldgen surface are outside walls, and one of them is
+    /// knocked out for an opening. The hole has to be in the TOP course: everything below the surface
+    /// has natural terrain behind it, so a hole down there is still a wall, only a wall made of soil.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Cellar_overlay_paints_ground_brown_and_openings_cyan()
+    {
+        (ITestPlayer player, BlockPos inside) = await Cellar("CaminusCellarOv", 1540);
+        try
+        {
+            // The middle block of the north wall, top interior course. What replaces it is real air
+            // still under the roof, so it joins the room, and the block beyond it sees the sky.
+            World.SetBlock(Air, inside.Offset(0, 1, -2));
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            await WaitForRoomReport(inside, r => r.Contains("Openings: 1 faces") && r.Contains("Sources: 4000 W"));
+
+            // Warm enough that every face loses heat, ground included: the sign of the flow is what
+            // picks between the two colours of each pair, and a lukewarm cellar would flicker.
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
+
+            player.Client.Clear();
+            await player.Say("/caminus overlay");
+            await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count > 0, 300);
+
+            RoomThermalSystem thermal = World.Api.ModLoader.GetModSystem<RoomThermalSystem>();
+            Assert.True(thermal.TryGetFaceFlows(inside, out RoomFlows? flows), "the cellar stopped being tracked");
+            Assert.DoesNotContain(flows!.Faces, f => f.Watts <= 0);
+
+            Dictionary<BlockPos, Rgba> cubes = player.Client.Highlights(OverlayServer.HighlightSlot)
+                .ToDictionary(c => c.Pos, c => c.Rgba);
+
+            // The nine floor blocks, two metres under the surface: brown, and the brown of a face
+            // losing heat rather than the darker one of a face taking it back.
+            List<FaceFlow> floor = [.. flows.Faces.Where(f => f.Face.Ground && f.Face.Facing == BlockFacing.DOWN)];
+            Assert.Equal(9, floor.Count);
+            foreach (FaceFlow f in floor)
+            {
+                Rgba c = cubes[f.Face.Pos];
+                Assert.Equal(OverlayServer.GroundLoss, (c.R, c.G, c.B));
+            }
+
+            // The hole: an opening is priced as one whatever the ground around it is doing.
+            FaceFlow opening = Assert.Single(flows.Faces, f => f.Face.Opening);
+            Rgba cyan = cubes[opening.Face.Pos];
+            Assert.Equal(OverlayServer.OpeningLoss, (cyan.R, cyan.G, cyan.B));
+
+            // An outside wall, above the surface: red or blue, and which one has to agree with the
+            // sign the model reports for that same face.
+            FaceFlow wall = flows.Faces.First(f => !f.Face.Ground && !f.Face.Opening);
+            Rgba hot = cubes[wall.Face.Pos];
+            Assert.Equal(wall.Watts >= 0 ? OverlayServer.WallLoss : OverlayServer.WallGain, (hot.R, hot.G, hot.B));
+
+            // And the puffs the packet asks the client to draw: watts and speed say the same thing
+            // about which way the heat goes, face by face, as the model does.
+            List<ParticleFace> puffs = player.Client.Packets<OverlayPacket>("caminus")[^1].Faces;
+            Assert.Equal(OverlayServer.ParticleFaces(flows).Count, puffs.Count);
+            foreach (ParticleFace p in puffs)
+            {
+                FaceFlow flow = flows.Faces.Single(f => f.Face.Pos.X == p.X && f.Face.Pos.Y == p.Y
+                                                        && f.Face.Pos.Z == p.Z && f.Face.Facing.Index == p.Facing);
+                Assert.Equal(flow.Watts >= 0, p.Watts >= 0);
+                Assert.Equal(p.Watts >= 0, p.Speed >= 0); // losing blows outward, gaining blows back in
+            }
+            Assert.Contains(puffs, p => p.Watts > 0 && p.Speed > 0);
+        }
+        finally { await Leave(player); }
+    }
+
+    /// <summary>
+    /// Two players in one heated room. The overlay is per player from end to end: the cubes go out
+    /// with <c>HighlightBlocks(player, ...)</c>, the text and the puffs ride a packet addressed to
+    /// that player, and nothing at all is spawned into the shared world any more, so the one who
+    /// never asked for the overlay sees an empty world and an empty channel.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Second_player_sees_its_own_overlay_only()
+    {
+        (ITestPlayer first, BlockPos inside) = await RoomAndPlayer("CaminusPairOne", 1620, Stone);
+        ITestPlayer second = await World.JoinPlayer("CaminusPairTwo");
+        try
+        {
+            // The two players read the room one course apart: the third HUD line prints the air at
+            // the eyes, and the firepit puts 1.6 K/m between them. The first is put on the floor
+            // rather than left to fall there, the second gets a block to stand on.
+            await first.TeleportTo(inside.Offset(-1, -1, -1));
+            World.SetBlock(Stone, inside.Offset(1, -1, 1));
+            await second.TeleportTo(inside.Offset(1, 0, 1));
+
+            BlockPos firepit = inside.Offset(0, -1, 0);
+            LightFirepit(firepit);
+            await World.Until(() => Firepit(firepit)?.IsBurning == true);
+            await WaitForRoomReport(inside, r => r.Contains("Stratification: 1.6 K/m"));
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 540f);
+            await World.Ticks(300);
+            World.Api.World.Calendar.SetTimeSpeedModifier("caminus-test", 0f);
+
+            first.Client.Clear();
+            second.Client.Clear();
+            await first.Say("/caminus overlay");
+            Assert.Contains(first.Client.ChatLines(), l => l.Contains("Thermal overlay on."));
+            await World.Until(() => first.Client.Highlights(OverlayServer.HighlightSlot).Count > 0, 300);
+
+            Assert.NotEmpty(first.Client.Highlights(OverlayServer.HighlightSlot));
+            Assert.NotEmpty(first.Client.Packets<OverlayPacket>("caminus"));
+            // The other player asked for nothing and receives nothing: no cubes, no packet, and no
+            // particle either, on either connection, since the puffs are spawned client side now.
+            Assert.Empty(second.Client.Highlights(OverlayServer.HighlightSlot));
+            Assert.Empty(second.Client.Packets<OverlayPacket>("caminus"));
+            Assert.Empty(first.Client.Particles());
+            Assert.Empty(second.Client.Particles());
+
+            second.Client.Clear();
+            await second.Say("/caminus overlay");
+            Assert.Contains(second.Client.ChatLines(), l => l.Contains("Thermal overlay on."));
+            await World.Until(() => second.Client.Highlights(OverlayServer.HighlightSlot).Count > 0, 300);
+            Assert.NotEmpty(second.Client.Highlights(OverlayServer.HighlightSlot));
+
+            // Both now get a packet of their own, built at their own eye height: one course apart in
+            // a room the fire keeps warmer at the top.
+            Assert.Equal(RoomThermalSystem.EyeBlockPos(first.Entity).Y + 1,
+                         RoomThermalSystem.EyeBlockPos(second.Entity).Y);
+            string firstText = first.Client.Packets<OverlayPacket>("caminus")[^1].Text;
+            string secondText = second.Client.Packets<OverlayPacket>("caminus")[^1].Text;
+            Assert.StartsWith("Room ", firstText);
+            Assert.StartsWith("Room ", secondText);
+            Assert.True(Read(EyesTemp(), secondText) > Read(EyesTemp(), firstText) + 1.0,
+                $"the two players read the same air\nfirst:\n{firstText}\nsecond:\n{secondText}");
+        }
+        finally
+        {
+            await Leave(first);
+            await Leave(second);
+        }
+    }
+
+    /// <summary>
+    /// The commands as a player runs them: said on the chat channel, answered in that player's own
+    /// chat lines. Atlas's own <c>ExecuteCommand</c> runs as the console, a caller with no entity and
+    /// no position, so this is the only place the player path is exercised end to end.
+    /// </summary>
+    [AtlasScenario(TimeoutMs = 240_000)]
+    public async Task Commands_answer_in_the_players_chat()
+    {
+        (ITestPlayer player, BlockPos inside) = await RoomAndPlayer("CaminusChat", 1700, Stone);
+        try
+        {
+            await WaitForRoomReport(inside);
+
+            player.Client.Clear();
+            await player.Say("/caminus version");
+            Assert.Contains(player.Client.ChatLines(), l => l.Contains("Caminus 0.1.0"));
+
+            player.Client.Clear();
+            await player.Say("/caminus temp");
+            Assert.Contains(player.Client.ChatLines(), l => l.Contains("Room:"));
+
+            // Back down on the ground under the box, where the command has to say there is no room
+            // rather than answer with the last one it knows.
+            await player.TeleportTo(World.Spawn.Offset(1700, 0, 40));
+            await World.Ticks(90);
+            player.Client.Clear();
+            await player.Say("/caminus temp");
+            Assert.Contains(player.Client.ChatLines(), l => l.Contains("No enclosed room here."));
+
+            player.Client.Clear();
+            await player.Say("/caminus overlay");
+            Assert.Contains(player.Client.ChatLines(), l => l.Contains("Thermal overlay on."));
+
+            player.Client.Clear();
+            await player.Say("/caminus overlay");
+            Assert.Contains(player.Client.ChatLines(), l => l.Contains("Thermal overlay off."));
         }
         finally { await Leave(player); }
     }

@@ -350,7 +350,10 @@ public class TemplateScenarios : AtlasScenarioBase
         Assert.Equal((sx, sy, sz), (schematic.SizeX, schematic.SizeY, schematic.SizeZ));
 
         string path = Path.Combine(TemplatesDir(), name + ".json");
-        File.WriteAllText(path, schematic.ToJson());
+        // The firepit block entity carries a timestamp, so every run would rewrite the committed
+        // files. Write once; delete a file (or set CAMINUS_REGEN_TEMPLATES=1) to regenerate it.
+        if (!File.Exists(path) || Environment.GetEnvironmentVariable("CAMINUS_REGEN_TEMPLATES") == "1")
+            File.WriteAllText(path, schematic.ToJson());
         return path;
     }
 
