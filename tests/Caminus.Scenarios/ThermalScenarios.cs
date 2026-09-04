@@ -982,7 +982,10 @@ public partial class ThermalScenarios : AtlasScenarioBase
             // The command's answer never becomes a chat line here: a real client's message goes through
             // the server's chat handler, which supplies the result callback, and Atlas has no "player
             // types this" entry point, so the answer only exists in the callback we pass ourselves.
-            Assert.Contains("Thermal overlay on.", PlayerReport(player, "/caminus overlay"));
+            // Said through the real client chat packet path (Atlas 0.12.0-rc.2): the command answer
+            // reaches this client's chat lines, which is what a real player reads.
+            await player.Say("/caminus overlay");
+            Assert.Contains(player.Client.ChatLines(), line => line.Contains("Thermal overlay on."));
 
             // The overlay rides the mod's own 1 s tick, i.e. 30 server ticks.
             await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count > 0, 300);
@@ -1030,7 +1033,8 @@ public partial class ThermalScenarios : AtlasScenarioBase
 
             // Off: the mod clears the slot and sends an empty text, and the empty highlight packet is
             // exactly how a slot is cleared client side.
-            Assert.Contains("Thermal overlay off.", PlayerReport(player, "/caminus overlay"));
+            await player.Say("/caminus overlay");
+            Assert.Contains(player.Client.ChatLines(), line => line.Contains("Thermal overlay off."));
             await World.Until(() => player.Client.Highlights(OverlayServer.HighlightSlot).Count == 0, 300);
             Assert.Equal("", player.Client.Packets<OverlayPacket>("caminus")[^1].Text);
 
